@@ -15,3 +15,14 @@ RTP/RTCP framing, and the G.711 codec, atop seal's DTLS + crypto.  Pairs with we
      (:file "g711")        ; G.711 PCMU (mu-law) + PCMA (A-law) companding
      (:file "rtp")         ; RTP + RTCP header pack/parse (RFC 3550)
      (:file "srtp")))))    ; DTLS-SRTP keying (RFC 5764) + SRTP/SRTCP AES-GCM (RFC 7714)
+
+(defsystem "webrtc-media/rtc"
+  :description "Session glue: full-duplex G.711/SRTP audio over a webrtc-data ICE/DTLS transport."
+  :version "0.1.0"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("webrtc-media" "webrtc-data" "bordeaux-threads")
+  :serial t
+  :components
+  ((:module "src"
+    :components ((:file "session")))))

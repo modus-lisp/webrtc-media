@@ -31,16 +31,39 @@
   (make-srtp-context :send-key send-key :send-salt send-salt
                      :recv-key recv-key :recv-salt recv-salt))
 
+(defun srtp-kdf (master-key master-salt label n)
+  "RFC 3711 §4.3 / RFC 7714 §11 session-key derivation: N key bytes for LABEL, via AES-128 in
+counter mode with key_derivation_rate = 0.  The counter block is MASTER-SALT left-aligned
+(rest zero), with LABEL XORed into byte 7 and a 16-bit block index in the last two bytes."
+  (let ((slen (length master-salt))
+        (out (make-array (* 16 (ceiling n 16)) :element-type '(unsigned-byte 8))))
+    (dotimes (j (ceiling n 16))
+      (let ((iv (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+        (replace iv master-salt :end2 slen)
+        (setf (aref iv 7) (logand (logxor (aref iv 7) label) #xff))
+        (setf (aref iv 14) (ldb (byte 8 8) j) (aref iv 15) (ldb (byte 8 0) j))
+        (replace out (seal:aes-128-encrypt-block master-key iv) :start1 (* j 16))))
+    (subseq out 0 n)))
+
+(defconstant +srtp-label-rtp-key+  #x00)
+(defconstant +srtp-label-rtp-salt+ #x02)
+
 (defun srtp-context-from-dtls (session &key (role :client))
-  "Derive an SRTP context from a finished seal DTLS SESSION.  ROLE :client (a=setup:active, our
-default) sends with the client keys; :server sends with the server keys."
+  "Derive an SRTP context from a finished seal DTLS SESSION.  The DTLS-SRTP exporter yields the
+MASTER key+salt per direction; SRTP then derives the SESSION key (16B) + salt (12B) from them via
+the KDF.  ROLE :client (a=setup:active, our default) sends with the client keys, receives with the
+server keys."
   (let* ((km (seal:dtls-export-keying-material
               session "EXTRACTOR-dtls_srtp" (* 2 (+ +gcm-key-len+ +gcm-salt-len+))))
-         (ck (subseq km 0 16)) (sk (subseq km 16 32))
-         (cs (subseq km 32 44)) (ss (subseq km 44 56)))
-    (if (eq role :client)
-        (make-srtp-context-keys ck cs sk ss)
-        (make-srtp-context-keys sk ss ck cs))))
+         (cmk (subseq km 0 16)) (smk (subseq km 16 32))          ; client/server MASTER keys
+         (cms (subseq km 32 44)) (sms (subseq km 44 56)))        ; client/server MASTER salts
+    (flet ((skey (mk ms) (srtp-kdf mk ms +srtp-label-rtp-key+ +gcm-key-len+))
+           (ssalt (mk ms) (srtp-kdf mk ms +srtp-label-rtp-salt+ +gcm-salt-len+)))
+      (let ((ck (skey cmk cms)) (cs (ssalt cmk cms))
+            (sk (skey smk sms)) (ss (ssalt smk sms)))
+        (if (eq role :client)
+            (make-srtp-context-keys ck cs sk ss)
+            (make-srtp-context-keys sk ss ck cs))))))
 
 (declaim (inline %u16 %u32))
 (defun %u16 (buf off) (logior (ash (aref buf off) 8) (aref buf (1+ off))))

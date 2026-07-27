@@ -21,4 +21,6 @@
    ;; SRTP
    #:srtp-context #:make-srtp-context #:srtp-context-from-dtls
    #:srtp-protect #:srtp-unprotect
-   #:+srtp-aead-aes-128-gcm+))
+   #:+srtp-aead-aes-128-gcm+
+   ;; session glue (webrtc-media/rtc)
+   #:start-audio))
