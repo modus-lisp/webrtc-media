@@ -14,7 +14,8 @@ RTP/RTCP framing, and the G.711 codec, atop seal's DTLS + crypto.  Pairs with we
     ((:file "packages")
      (:file "g711")        ; G.711 PCMU (mu-law) + PCMA (A-law) companding
      (:file "rtp")         ; RTP + RTCP header pack/parse (RFC 3550)
-     (:file "srtp")))))    ; DTLS-SRTP keying (RFC 5764) + SRTP/SRTCP AES-GCM (RFC 7714)
+     (:file "srtp")        ; DTLS-SRTP keying (RFC 5764) + SRTP/SRTCP AES-GCM (RFC 7714)
+     (:file "vp8-bool")))))  ; VP8 boolean entropy coder (RFC 6386 §7/§13) — first piece of the VP8 codec
 
 (defsystem "webrtc-media/rtc"
   :description "Session glue: full-duplex G.711/SRTP audio over a webrtc-data ICE/DTLS transport."
