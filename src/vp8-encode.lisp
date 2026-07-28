@@ -94,15 +94,50 @@ and column to the left; 128 when neither exists."
     (when (plusp x) (dotimes (i size) (incf sum (aref plane (+ (* (+ y i) stride) (1- x)))) (incf n)))
     (if (zerop n) 128 (floor (+ sum (floor n 2)) n))))
 
-(defun encode-gray-frame (src width height &key (qi 30))
+
+(defun code-chroma-mb (tw probs src src-w src-h recon rw mbx mby above left uvdcq uvacq)
+  "Code one macroblock's 8x8 chroma plane region: DC_PRED against the reconstruction, then the
+four 4x4 sub-blocks (type 2, from coefficient 0).  SRC may be NIL for a neutral (128) plane.
+Reconstructs into RECON so later macroblocks predict from what the decoder will have."
+  (let* ((ox (* mbx 8)) (oy (* mby 8))
+         (pred (dc-pred recon rw ox oy 8))
+         (blk (mkblk)) (co (mkblk)) (q (mkblk)) (dq (mkblk)) (rec (mkblk)))
+    (dotimes (b 4)
+      (let ((bx (+ ox (* 4 (mod b 2)))) (by (+ oy (* 4 (floor b 2)))))
+        (dotimes (i 16)
+          (let* ((px (min (1- src-w) (+ bx (mod i 4)))) (py (min (1- src-h) (+ by (floor i 4)))))
+            (setf (aref blk i) (- (if src (aref src (+ (* py src-w) px)) 128) pred))))
+        (fdct4x4 blk co)
+        (zigzag-quantize co q uvdcq uvacq)
+        (let* ((ai (+ (* 2 mbx) (mod b 2))) (li (floor b 2))
+               (ctx (+ (aref above ai) (aref left li)))
+               (nz (write-block tw probs +blk-uv+ q 0 ctx)))
+          (setf (aref above ai) (if nz 1 0) (aref left li) (if nz 1 0)))
+        (dotimes (i 16) (setf (aref dq (aref +zigzag+ i)) (* (aref q i) (if (zerop i) uvdcq uvacq))))
+        (idct4x4 dq rec)
+        (dotimes (i 16)
+          (let ((px (+ bx (mod i 4))) (py (+ by (floor i 4))))
+            (setf (aref recon (+ (* py rw) px))
+                  (max 0 (min 255 (+ pred (aref rec i)))))))))))
+
+(defun encode-gray-frame (src width height &key (qi 30) u v)
   "Encode an 8-bit grayscale image SRC (WIDTH*HEIGHT bytes, row-major) as a VP8 keyframe with real
-DC+AC coefficients.  Chroma is left at neutral (128) so the picture is greyscale.  Returns bytes."
+DC+AC coefficients.  U and V, when supplied, are the 4:2:0 chroma planes (each ceiling(w/2) x
+ceiling(h/2)); without them chroma stays neutral (128) and the picture is greyscale.
+Returns (values frame-bytes luma-reconstruction)."
   (let* ((mb-cols (ceiling width 16)) (mb-rows (ceiling height 16))
          (pw (* mb-cols 16)) (ph (* mb-rows 16))
          (bw (make-bwriter)) (tw (make-bwriter))
          (probs +default-coef-probs+)
          (dcq (dc-quant qi)) (acq (ac-quant qi)) (y2dcq (y2-dc-quant qi)) (y2acq (y2-ac-quant qi))
          (recon (make-array (* pw ph) :element-type '(unsigned-byte 8) :initial-element 128))
+         ;; chroma: 4:2:0, so each macroblock owns an 8x8 region of each plane
+         (cw (* mb-cols 8)) (chh (* mb-rows 8))
+         (sw (ceiling width 2)) (sh (ceiling height 2))
+         (urec (make-array (* cw chh) :element-type '(unsigned-byte 8) :initial-element 128))
+         (vrec (make-array (* cw chh) :element-type '(unsigned-byte 8) :initial-element 128))
+         ;; uv DC quantizer is clamped to 132 (RFC 6386 s14.1); uv AC is the plain AC quantizer
+         (uvdcq (min 132 (dc-quant qi))) (uvacq (ac-quant qi))
          (ctxs (make-contexts mb-cols))
          (blk (mkblk)) (co (mkblk)) (dq (mkblk)) (rec (mkblk))
          (y2in (mkblk)) (y2co (mkblk)) (y2q (mkblk)) (y2dq (mkblk)))
@@ -148,15 +183,11 @@ DC+AC coefficients.  Chroma is left at neutral (128) so the picture is greyscale
                      (nz (write-block tw probs +blk-y-after-y2+ (aref acq-blocks b) 1 ctx)))
                 (setf (aref (ec-above-y ctxs) (+ (* 4 mbx) bcol)) (if nz 1 0)
                       (aref (ec-left-y ctxs) brow) (if nz 1 0))))
-            ;; chroma: neutral, so every block is empty — but still coded (EOB) with context
-            (dotimes (b 4)
-              (let* ((ctx (+ (aref (ec-above-u ctxs) (+ (* 2 mbx) (mod b 2))) (aref (ec-left-u ctxs) (floor b 2)))))
-                (write-token tw probs +blk-uv+ 0 ctx +tok-eob+)
-                (setf (aref (ec-above-u ctxs) (+ (* 2 mbx) (mod b 2))) 0 (aref (ec-left-u ctxs) (floor b 2)) 0)))
-            (dotimes (b 4)
-              (let* ((ctx (+ (aref (ec-above-v ctxs) (+ (* 2 mbx) (mod b 2))) (aref (ec-left-v ctxs) (floor b 2)))))
-                (write-token tw probs +blk-uv+ 0 ctx +tok-eob+)
-                (setf (aref (ec-above-v ctxs) (+ (* 2 mbx) (mod b 2))) 0 (aref (ec-left-v ctxs) (floor b 2)) 0)))
+            ;; chroma: real 4:2:0 coding (neutral 128 when no planes were supplied)
+            (code-chroma-mb tw probs u sw sh urec cw mbx mby
+                            (ec-above-u ctxs) (ec-left-u ctxs) uvdcq uvacq)
+            (code-chroma-mb tw probs v sw sh vrec cw mbx mby
+                            (ec-above-v ctxs) (ec-left-v ctxs) uvdcq uvacq)
             ;; ---- reconstruct this MB exactly as the decoder will (feeds later predictions) ----
             (dotimes (i 16)
               (setf (aref y2dq i) (* (aref y2q i) (if (zerop i) y2dcq y2acq))))
