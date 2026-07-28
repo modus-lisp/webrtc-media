@@ -132,7 +132,10 @@ DC+AC coefficients.  Chroma is left at neutral (128) so the picture is greyscale
             ;; BOTH ffmpeg decoders reconstruct ~1.2x our intended amplitude, consistently across
             ;; every quantizer index.  Until that factor is explained, scale the Y2 DC down so the
             ;; DECODED picture matches the source; the residual mystery is tracked in the header.
-            (setf (aref y2co 0) (round (* (aref y2co 0) 100) +y2-dc-fudge+))
+            ;; ALL Y2 coefficients need it, not just the DC: the Y2 ACs distribute the sixteen
+            ;; luma DCs across the macroblock, so scaling only the DC left every varying block
+            ;; mis-weighted (flat MBs have no Y2 AC, which is why they looked correct).
+            (dotimes (i 16) (setf (aref y2co i) (round (* (aref y2co i) 100) +y2-dc-fudge+)))
             (zigzag-quantize y2co y2q y2dcq y2acq)
             ;; code Y2 (block type 1) with its own context
             (let* ((ctx (+ (aref (ec-above-y2 ctxs) mbx) (ec-left-y2 ctxs)))
@@ -160,8 +163,7 @@ DC+AC coefficients.  Chroma is left at neutral (128) so the picture is greyscale
             ;; error compounds macroblock by macroblock (seen as the picture sliding dark).
             (dotimes (i 16)
               (setf (aref y2dq i)
-                    (let ((v (* (aref y2q i) (if (zerop i) y2dcq y2acq))))
-                      (if (zerop i) (round (* v +y2-dc-fudge+) 100) v))))
+                    (round (* (* (aref y2q i) (if (zerop i) y2dcq y2acq)) +y2-dc-fudge+) 100)))
             (let ((y2r (mkblk)))
               (dotimes (i 16) (setf (aref y2in i) (aref y2dq (position i +zigzag+))))
               (iwht4x4 y2in y2r)

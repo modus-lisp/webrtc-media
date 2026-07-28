@@ -20,7 +20,8 @@ RTP/RTCP framing, and the G.711 codec, atop seal's DTLS + crypto.  Pairs with we
      (:file "vp8-tables")   ; VP8 constant probability tables (from libvpx)
      (:file "vp8-tokens")   ; VP8 coefficient token coding (RFC 6386 §13)
      (:file "vp8")          ; VP8 keyframe encoder (RFC 6386 §9)
-     (:file "vp8-encode")))))  ; real encoder: DC+AC, entropy contexts, prediction+reconstruction
+     (:file "vp8-encode")   ; real encoder
+     (:file "vp8-parse")))))  ; bitstream parser (debug oracle)  ; real encoder: DC+AC, entropy contexts, prediction+reconstruction
 
 (defsystem "webrtc-media/rtc"
   :description "Session glue: full-duplex G.711/SRTP audio over a webrtc-data ICE/DTLS transport."
