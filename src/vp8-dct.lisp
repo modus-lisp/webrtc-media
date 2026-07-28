@@ -75,10 +75,11 @@
              (c1 (- (aref tmp (+ i 4)) (aref tmp (+ i 12))))
              (d1 (- (aref tmp (+ i 0)) (aref tmp (+ i 8))))
              (a2 (+ a1 b1)) (b2 (+ d1 c1)) (c2 (- d1 c1)) (d2 (- a1 b1)))
-        (setf (aref out (+ i 0)) (ash (+ a2 (if (plusp a2) 1 0)) -3)
-              (aref out (+ i 4)) (ash (+ b2 (if (plusp b2) 1 0)) -3)
-              (aref out (+ i 8)) (ash (+ c2 (if (plusp c2) 1 0)) -3)
-              (aref out (+ i 12)) (ash (+ d2 (if (plusp d2) 1 0)) -3))))
+        ;; libvpx: a2 += (a2 < 0)  — the bias is added on NEGATIVE values, not positive
+        (setf (aref out (+ i 0)) (ash (+ a2 3 (if (minusp a2) 1 0)) -3)
+              (aref out (+ i 4)) (ash (+ b2 3 (if (minusp b2) 1 0)) -3)
+              (aref out (+ i 8)) (ash (+ c2 3 (if (minusp c2) 1 0)) -3)
+              (aref out (+ i 12)) (ash (+ d2 3 (if (minusp d2) 1 0)) -3))))
     out))
 
 (defun iwht4x4 (in out)
@@ -111,6 +112,12 @@
 (defun qclamp (q) (max 0 (min 127 q)))
 (defun dc-quant (qi) (aref +dc-qlookup+ (qclamp qi)))
 (defun ac-quant (qi) (aref +ac-qlookup+ (qclamp qi)))
+;; Second-order (Y2) quantizers, libvpx common/quant_common.c vp8_dc2quant / vp8_ac2quant.
+;; The AC one is ac_qlookup*155/100 done as an exact integer op — (x*101581)>>16 — with a
+;; floor of 8; rounding it as 155*x/100 to nearest disagrees at several quantizer indices
+;; (e.g. qi=10: libvpx 21, nearest-rounding 22), which corrupts every Y2 AC coefficient.
+(defun y2-dc-quant (qi) (* 2 (dc-quant qi)))
+(defun y2-ac-quant (qi) (max 8 (ash (* (ac-quant qi) 101581) -16)))
 
 (defun quantize-block (coeffs levels dcq acq)
   "Quantize 16 COEFFS into LEVELS: DC (index 0) by DCQ, AC (1..15) by ACQ.  Round to nearest."

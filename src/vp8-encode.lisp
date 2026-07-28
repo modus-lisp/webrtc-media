@@ -18,26 +18,28 @@
 ;;;; Luma uses 16x16 DC_PRED, so the sixteen 4x4 luma DCs go through the WHT into the Y2 block and
 ;;;; the luma blocks themselves are coded from coefficient 1.
 ;;;;
-;;;; STATUS: the DC path is CORRECT and verified against ffmpeg; AC coding is not yet.
+;;;; STATUS: correct.  ENCODE-GRAY-FRAME's second return value is the encoder's own reconstruction,
+;;;; and it is bit-identical to what ffmpeg's decoder produces for every image, size and quantizer
+;;;; index tested (flat, gradients, hard edges, uniform noise; 0..127; non-multiple-of-16 sizes).
 ;;;;
-;;;;   working  - flat frames decode EXACTLY (request 200, decode 200) at every quantizer index
-;;;;   working  - macroblock-level variation: 16 MBs spanning 40..220 decode within 1-8 units, so
-;;;;              DC_PRED chaining off reconstructed neighbours and the entropy contexts are right
-;;;;   working  - sign, category extra bits (a real bug fixed here: they are written MSB-first with
-;;;;              ps[0] first, not reversed), multi-block ordering
-;;;;   BROKEN   - blocks carrying AC coefficients: any intra-macroblock detail collapses the picture
-;;;;              to near-black, so an AC-bearing block desynchronises the reader.  Amplitude was
-;;;;              ruled out (scaling the ACs changes nothing), so the fault is in band selection or
-;;;;              the context progression across coefficients 1..15.
+;;;; Two bugs were fixed to get here, both about matching the reference exactly:
 ;;;;
-;;;; NEXT: build a VP8 bitstream PARSER on the (bit-exact) bool decoder and read our own token
-;;;; partition back, comparing token-by-token with what we intended — bisecting an AC-bearing block
-;;;; precisely instead of guessing.  Every fix so far came from exactly this kind of ground truth.
+;;;;  a. SKIP_EOB_NODE.  The EOB branch of the coefficient tree is NOT coded after a ZERO
+;;;;     coefficient — libvpx's GetCoeffs (decoder/detokenize.c) re-enters the tree below node 0
+;;;;     in that case, and its tokenizer mirrors it with `t->skip_eob_node = (pt == 0)`.  Emitting
+;;;;     that bit desynchronised the whole token partition as soon as any block had an interior
+;;;;     zero, i.e. as soon as the picture had detail.  See WRITE-BLOCK.
+;;;;
+;;;;  b. The Y2 AC quantizer is libvpx's exact integer form (ac_q * 101581) >> 16 with a floor of
+;;;;     8, not ac_q * 155/100 rounded to nearest; the two disagree at 63 of the 128 quantizer
+;;;;     indices.  See Y2-AC-QUANT in vp8-dct.lisp.
+;;;;
+;;;; And one thing that turned out NOT to be a bug: a supposed 1.2x amplitude error (once papered
+;;;; over by a `+y2-dc-fudge+' constant) was an artefact of the measurement, not the codec.
+;;;; Decoding with `ffmpeg -pix_fmt gray' makes swscale expand limited-range luma to full range
+;;;; (x255/219 = 1.164); decode to yuv420p and take the Y plane to see what VP8 actually produced.
 
 (in-package #:webrtc-media.vp8)
-
-(defconstant +y2-dc-fudge+ 120
-  "Percent: decoders reconstruct ~1.2x our intended Y2 DC amplitude (see note at the call site).")
 
 (defstruct (ectx (:conc-name ec-))
   "Entropy contexts: above (per MB column) and left (per MB), one flag per sub-block."
@@ -54,16 +56,22 @@
 
 (defun write-block (bw probs type coeffs first-coef ctx)
   "Code one 4x4 block's quantized COEFFS (already in zigzag order) starting at FIRST-COEF with
-initial entropy context CTX.  Returns T if the block had any non-zero coefficient."
+initial entropy context CTX.  Returns T if the block had any non-zero coefficient.
+
+The EOB branch of the coefficient tree is coded for the first position (there it is really a
+`this block has coefficients' flag) and after every NON-ZERO coefficient — but never after a
+ZERO one.  libvpx's decoder (detokenize.c GetCoeffs) simply does not read that bit when the
+previous token was DCT_0, and its encoder mirrors that with skip_eob_node = (pt == 0)."
   (let ((last -1))
     (loop for i from first-coef below 16 when (/= 0 (aref coeffs i)) do (setf last i))
     (if (< last 0)
         (progn (write-token bw probs type (aref +coef-bands+ first-coef) ctx +tok-eob+) nil)
-        (let ((c ctx))
+        (let ((c ctx) (skip nil))
           (loop for i from first-coef to last
                 for v = (aref coeffs i)
-                do (write-coef bw probs type (aref +coef-bands+ i) c v)
-                   (setf c (cond ((zerop v) 0) ((= 1 (abs v)) 1) (t 2))))
+                do (write-coef bw probs type (aref +coef-bands+ i) c v skip)
+                   (setf c (cond ((zerop v) 0) ((= 1 (abs v)) 1) (t 2))
+                         skip (zerop c)))
           (when (< last 15)                     ; EOB unless the block ran to the end
             (write-token bw probs type (aref +coef-bands+ (1+ last)) c +tok-eob+))
           t))))
@@ -74,7 +82,8 @@ initial entropy context CTX.  Returns T if the block had any non-zero coefficien
     (let* ((src (aref +zigzag+ i))
            (q (if (zerop i) dcq acq))
            (v (if (< i first) 0 (quant1 (aref coeffs src) q))))
-      (setf (aref out i) v))))
+      ;; DCT_MAX_VALUE: the token alphabet only reaches +-2047 (cat6 = 67 + 11 extra bits)
+      (setf (aref out i) (max -2047 (min 2047 v))))))
 
 ;;; ---- prediction + reconstruction -------------------------------------------
 (defun dc-pred (plane stride x y size)
@@ -92,7 +101,7 @@ DC+AC coefficients.  Chroma is left at neutral (128) so the picture is greyscale
          (pw (* mb-cols 16)) (ph (* mb-rows 16))
          (bw (make-bwriter)) (tw (make-bwriter))
          (probs +default-coef-probs+)
-         (dcq (dc-quant qi)) (acq (ac-quant qi)) (y2dcq (* 2 (dc-quant qi))) (y2acq (round (* 155 (ac-quant qi)) 100))
+         (dcq (dc-quant qi)) (acq (ac-quant qi)) (y2dcq (y2-dc-quant qi)) (y2acq (y2-ac-quant qi))
          (recon (make-array (* pw ph) :element-type '(unsigned-byte 8) :initial-element 128))
          (ctxs (make-contexts mb-cols))
          (blk (mkblk)) (co (mkblk)) (dq (mkblk)) (rec (mkblk))
@@ -127,15 +136,6 @@ DC+AC coefficients.  Chroma is left at neutral (128) so the picture is greyscale
             ;; Y2: WHT of the sixteen luma DCs
             (dotimes (i 16) (setf (aref y2in i) (aref dcs i)))
             (fwht4x4 y2in y2co)
-            ;; EMPIRICAL CALIBRATION.  Our forward chain and libvpx's inverse formulas agree on
-            ;; paper (a flat residual of 72 traces to exactly 200 through our own inverses), yet
-            ;; BOTH ffmpeg decoders reconstruct ~1.2x our intended amplitude, consistently across
-            ;; every quantizer index.  Until that factor is explained, scale the Y2 DC down so the
-            ;; DECODED picture matches the source; the residual mystery is tracked in the header.
-            ;; ALL Y2 coefficients need it, not just the DC: the Y2 ACs distribute the sixteen
-            ;; luma DCs across the macroblock, so scaling only the DC left every varying block
-            ;; mis-weighted (flat MBs have no Y2 AC, which is why they looked correct).
-            (dotimes (i 16) (setf (aref y2co i) (round (* (aref y2co i) 100) +y2-dc-fudge+)))
             (zigzag-quantize y2co y2q y2dcq y2acq)
             ;; code Y2 (block type 1) with its own context
             (let* ((ctx (+ (aref (ec-above-y2 ctxs) mbx) (ec-left-y2 ctxs)))
@@ -158,12 +158,8 @@ DC+AC coefficients.  Chroma is left at neutral (128) so the picture is greyscale
                 (write-token tw probs +blk-uv+ 0 ctx +tok-eob+)
                 (setf (aref (ec-above-v ctxs) (+ (* 2 mbx) (mod b 2))) 0 (aref (ec-left-v ctxs) (floor b 2)) 0)))
             ;; ---- reconstruct this MB exactly as the decoder will (feeds later predictions) ----
-            ;; Reconstruct exactly as the DECODER will — including the same amplitude factor we
-            ;; compensated for on the way out, or our predictions drift from the decoder's and the
-            ;; error compounds macroblock by macroblock (seen as the picture sliding dark).
             (dotimes (i 16)
-              (setf (aref y2dq i)
-                    (round (* (* (aref y2q i) (if (zerop i) y2dcq y2acq)) +y2-dc-fudge+) 100)))
+              (setf (aref y2dq i) (* (aref y2q i) (if (zerop i) y2dcq y2acq))))
             (let ((y2r (mkblk)))
               (dotimes (i 16) (setf (aref y2in i) (aref y2dq (position i +zigzag+))))
               (iwht4x4 y2in y2r)
@@ -183,4 +179,6 @@ DC+AC coefficients.  Chroma is left at neutral (128) so the picture is greyscale
       (write-uncompressed-header frame width height (length part1))
       (loop for b across part1 do (vector-push-extend b frame))
       (loop for b across part2 do (vector-push-extend b frame))
-      frame)))
+      ;; second value: the reconstruction (PW x PH), i.e. exactly the luma plane a conforming
+      ;; decoder produces.  Useful as a self-check — it must match a real decoder bit for bit.
+      (values frame recon pw ph))))

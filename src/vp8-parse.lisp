@@ -5,20 +5,15 @@
 ;;;; understanding of the bitstream matches a real encoder's; pointed at our own frame it shows
 ;;;; what a reader actually sees.  Ground truth beats guessing — every VP8 fix so far came from it.
 ;;;;
-;;;; What it has already established:
+;;;; What it has established:
 ;;;;   * it parses a real libvpx keyframe cleanly (headers, quantizer, modes, coefficients), so our
 ;;;;     structural model of the bitstream is right
-;;;;   * it reads OUR frames back with the values we intended (a gradient MB's Y2 DC of -227 is
-;;;;     exactly the -68 luma residual we meant), so our writer and a spec-following reader agree
-;;;;   * libvpx's own flat-200 frame carries Y2 DC = 240 at qi=4 and decodes to exactly 200, while
-;;;;     the same arithmetic says 188 — an INDEPENDENT confirmation of the ~1.2x modelling error
-;;;;     captured in +y2-dc-fudge+ (so that constant is compensating something real, not papering
-;;;;     over a coding mistake)
+;;;;   * it reads OUR frames back with the values we intended
 ;;;;
-;;;; Still open: blocks with AC coefficients decode wrong even though this parser reads them back
-;;;; correctly.  Since writer and reader agree but ffmpeg disagrees, the fault is a shared
-;;;; misunderstanding.  The 1.2x discrepancy is the strongest lead — resolving where it comes from
-;;;; (likely the same place) should fix the AC path too.
+;;;; CAUTION, learned the hard way: a parser that shares a misunderstanding with the writer will
+;;;; happily agree with it.  That is what happened with skip_eob_node (see READ-TOKEN) — writer and
+;;;; parser agreed, and only ffmpeg disagreed.  When the two agree but a real decoder does not,
+;;;; suspect this file as much as the encoder.
 
 (in-package #:webrtc-media.vp8)
 
@@ -26,9 +21,11 @@
 (defparameter +coef-tree+
   #(-11 2  -0 4  -1 6  8 12  -2 10  -3 -4  14 16  -5 -6  18 20  -7 -8  -9 -10))
 
-(defun read-token (br probs type band ctx)
-  "Walk vp8_coef_tree with the [type][band][ctx] probabilities; returns the token id."
-  (let ((i 0))
+(defun read-token (br probs type band ctx &optional skip-eob)
+  "Walk vp8_coef_tree with the [type][band][ctx] probabilities; returns the token id.
+When SKIP-EOB (the previous coefficient in this block was ZERO) the EOB branch is not coded
+at all — libvpx's GetCoeffs re-enters the tree below node 0 — so start the walk at node 1."
+  (let ((i (if skip-eob 2 0)))
     (loop
       (let* ((node (ash i -1))
              (bit (bread-bit br (coef-prob probs type band ctx node)))
@@ -51,14 +48,15 @@
 
 (defun read-block (br probs type first-coef ctx)
   "Read one block's coefficients; returns (values coefficient-vector any-nonzero)."
-  (let ((out (make-array 16 :initial-element 0)) (c ctx) (nz nil))
+  (let ((out (make-array 16 :initial-element 0)) (c ctx) (nz nil) (skip nil))
     (loop for i from first-coef below 16 do
-      (let ((tok (read-token br probs type (aref +coef-bands+ i) c)))
+      (let ((tok (read-token br probs type (aref +coef-bands+ i) c skip)))
         (when (= tok +tok-eob+) (return))
         (let ((v (read-coef-value br tok)))
           (setf (aref out i) v)
           (unless (zerop v) (setf nz t))
-          (setf c (cond ((zerop v) 0) ((= 1 (abs v)) 1) (t 2))))))
+          (setf c (cond ((zerop v) 0) ((= 1 (abs v)) 1) (t 2))
+                skip (zerop c)))))
     (values out nz)))
 
 (defun parse-keyframe (bytes &key (max-blocks 8) (verbose t))
