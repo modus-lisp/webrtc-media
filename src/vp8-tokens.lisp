@@ -66,7 +66,8 @@ extra bits, then the sign.  Returns the token used."
       (let* ((c (- token +tok-cat1+))
              (ps (aref +cat-probs+ c))
              (extra (- mag (aref +cat-base+ c))))
-        (loop for i from (1- (length ps)) downto 0
+        ;; extra bits: MSB first, probability ps[0] first (RFC 6386 §13.2 / libvpx)
+        (loop for i from 0 below (length ps)
               do (bwrite-bit bw (aref ps i) (logand (ash extra (- (- (length ps) 1 i))) 1)))))
     ;; WIP: sign handling is not yet right — positive DC decodes correctly with this
     ;; polarity but negative does not, which points at the entropy-context modelling below
