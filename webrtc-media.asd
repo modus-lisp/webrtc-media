@@ -18,6 +18,7 @@ RTP/RTCP framing, and the G.711 codec, atop seal's DTLS + crypto.  Pairs with we
      (:file "vp8-bool")     ; VP8 boolean entropy coder (RFC 6386 §7/§13)
      (:file "vp8-dct")      ; VP8 4x4 DCT/WHT + quantization (RFC 6386 §14)
      (:file "vp8-tables")   ; VP8 constant probability tables (from libvpx)
+     (:file "vp8-tokens")   ; VP8 coefficient token coding (RFC 6386 §13)
      (:file "vp8")))))       ; VP8 keyframe encoder (RFC 6386 §9)
 
 (defsystem "webrtc-media/rtc"
@@ -29,4 +30,6 @@ RTP/RTCP framing, and the G.711 codec, atop seal's DTLS + crypto.  Pairs with we
   :serial t
   :components
   ((:module "src"
-    :components ((:file "session")))))
+    :serial t
+    :components ((:file "session")
+                 (:file "vp8-rtp")))))   ; VP8 RTP payload format (RFC 7741) + video sender

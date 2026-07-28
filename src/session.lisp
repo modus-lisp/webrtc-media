@@ -63,4 +63,5 @@ Returns a STOP thunk."
              (error (e) (when log (funcall log (format nil "audio tx: ~a" e)))))
            (sleep *audio-frame-secs*))))
      :name "wm-audio-tx")
-    (lambda () (setf running nil (webrtc-data:ice-agent-on-media agent) nil))))
+    ;; return both a stop thunk and the SRTP context (video reuses it — same DTLS keys, own SSRC)
+    (values (lambda () (setf running nil (webrtc-data:ice-agent-on-media agent) nil)) ctx)))

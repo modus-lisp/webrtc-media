@@ -23,4 +23,4 @@
    #:srtp-protect #:srtp-unprotect
    #:+srtp-aead-aes-128-gcm+
    ;; session glue (webrtc-media/rtc)
-   #:start-audio))
+   #:start-audio #:start-video #:vp8-packetize))
