@@ -129,3 +129,36 @@ chroma directly.  Only DC is non-zero, so this is exactly the token coder's simp
   "Forward-WHT DC of sixteen identical luma DC values."
   (let ((in (mkblk dc)) (out (mkblk))) (fwht4x4 in out) (aref out 0)))
 (defun quant1 (v q) (if (minusp v) (- (floor (+ (- v) (floor q 2)) q)) (floor (+ v (floor q 2)) q)))
+
+(defun encode-keyframe-checker (width height &key (qi 40) (phase 0) (bright 200))
+  "A checkerboard of macroblocks: half left at the DC prediction (mid-gray 128) via mb_skip_coeff,
+half coded with a positive luma DC so they decode BRIGHT.  PHASE flips which squares are which,
+so alternating frames animate.  Uses only the verified-positive DC path (no chroma, no negatives)."
+  (let* ((mb-cols (ceiling width 16)) (mb-rows (ceiling height 16))
+         (bw (make-bwriter)) (tw (make-bwriter))
+         (y2dcq (* 2 (dc-quant qi)))
+         (qy2 (quant1 (flat-wht-dc (flat-dc-coeff (- bright 128))) y2dcq))
+         (prob-skip 128))
+    (bwrite-literal bw 0 1) (bwrite-literal bw 0 1) (bwrite-literal bw 0 1)
+    (bwrite-literal bw 0 1) (bwrite-literal bw 0 6) (bwrite-literal bw 0 3)
+    (bwrite-literal bw 0 1) (bwrite-literal bw 0 2) (bwrite-literal bw qi 7)
+    (dotimes (i 5) (bwrite-literal bw 0 1))
+    (bwrite-literal bw 0 1)
+    (loop for p across +coeff-update-probs+ do (bwrite-bit bw p 0))
+    (bwrite-literal bw 1 1)                     ; mb_no_skip_coeff = 1 -> per-MB skip flags
+    (bwrite-literal bw prob-skip 8)
+    (let ((probs +default-coef-probs+))
+      (dotimes (r mb-rows)
+        (dotimes (c mb-cols)
+          (let ((lit (= (mod (+ r c phase) 2) 0)))       ; lit = coded bright, else skipped (gray)
+            (bwrite-bit bw prob-skip (if lit 0 1))       ; mb_skip_coeff: 0 = has coefficients
+            (write-ymode-dc bw) (write-uvmode-dc bw)
+            (when lit                                     ; tokens only for non-skipped MBs
+              (write-dc-only-block tw probs +blk-y2+ qy2 0)
+              (dotimes (b 16) (write-token tw probs +blk-y-after-y2+ 1 0 +tok-eob+))
+              (dotimes (b 8) (write-token tw probs +blk-uv+ 0 0 +tok-eob+)))))))
+    (let ((part1 (bwrite-finish bw)) (part2 (bwrite-finish tw)) (frame (u8buf)))
+      (write-uncompressed-header frame width height (length part1))
+      (loop for b across part1 do (vector-push-extend b frame))
+      (loop for b across part2 do (vector-push-extend b frame))
+      frame)))

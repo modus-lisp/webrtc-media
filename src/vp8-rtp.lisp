@@ -42,7 +42,12 @@ Returns a STOP thunk."
        (let ((seq 0) (ts 0) (n 0))
          (loop while running do
            (handler-case
-               (let ((frame (vp8::encode-keyframe-gray width height)))
+               ;; alternate two ffmpeg-verified frames so motion is unmistakable:
+               ;; even = uniform mid-gray (all macroblocks skipped), odd = bright/gradient
+               ;; pattern (first column left at the DC prediction, the rest coded bright).
+               (let ((frame (if (evenp (floor n 3))
+                                (vp8::encode-keyframe-gray width height)
+                                (vp8::encode-keyframe-checker width height :phase 1))))
                  (multiple-value-bind (pkts next) (vp8-packetize frame seq ts ssrc pt)
                    (setf seq next)
                    (dolist (p pkts)
