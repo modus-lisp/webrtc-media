@@ -71,7 +71,7 @@ extra bits, then the sign.  Returns the token used."
     ;; WIP: sign handling is not yet right — positive DC decodes correctly with this
     ;; polarity but negative does not, which points at the entropy-context modelling below
     ;; rather than the sign bit itself.
-    (unless (zerop mag) (bwrite-flag bw (plusp value)))
+    (unless (zerop mag) (bwrite-flag bw (minusp value)))   ; RFC 6386: 1 = negative
     token))
 
 (defun write-dc-only-block (bw probs block-type dc ctx)
