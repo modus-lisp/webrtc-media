@@ -212,4 +212,6 @@ Returns (values frame-bytes luma-reconstruction)."
       (loop for b across part2 do (vector-push-extend b frame))
       ;; second value: the reconstruction (PW x PH), i.e. exactly the luma plane a conforming
       ;; decoder produces.  Useful as a self-check — it must match a real decoder bit for bit.
-      (values frame recon pw ph))))
+      ;; the reconstruction planes are exactly what a conforming decoder produces — they seed the
+      ;; reference for the inter frames that follow (and double as a self-check).
+      (values frame recon urec vrec pw ph))))
