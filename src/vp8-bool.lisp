@@ -21,8 +21,11 @@
   (low 0) (range 255) (count -24)
   (buf (make-array 1024 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
 
+(declaim (inline bwrite-bit))
 (defun bwrite-bit (bw prob bit)
   "Encode BIT (0/1) with PROB = P(bit=0), an 8-bit probability (RFC 6386 §13.2)."
+  (declare (type (unsigned-byte 8) prob) (type bit bit)
+           (optimize (speed 3) (safety 0)))
   (let* ((split (+ 1 (ash (* (- (bw-range bw) 1) prob) -8)))
          (range split)
          (low (bw-low bw)))

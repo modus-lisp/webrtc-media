@@ -34,9 +34,17 @@
 
 (defstruct (venc (:conc-name ve-))
   "Stateful encoder: holds the previous reconstruction, which is the reference for the next frame."
-  width height mb-cols mb-rows pw ph cw chh
-  ref-y ref-u ref-v                            ; reconstruction = what the decoder holds
-  prev-y prev-u prev-v                         ; previous SOURCE, for deciding what actually changed
+  ;; slot types matter: without them every plane access in the macroblock loop goes through
+  ;; SB-KERNEL:HAIRY-DATA-VECTOR-REF, which the profile showed was ~10% of encode time
+  (width 0 :type fixnum) (height 0 :type fixnum)
+  (mb-cols 0 :type fixnum) (mb-rows 0 :type fixnum)
+  (pw 0 :type fixnum) (ph 0 :type fixnum) (cw 0 :type fixnum) (chh 0 :type fixnum)
+  (ref-y nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (ref-u nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (ref-v nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (prev-y nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (prev-u nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (prev-v nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (have-ref nil) (frames 0))
 
 (defun make-encoder (width height)
@@ -76,12 +84,17 @@ the whole screen every frame.  What we want for a desktop is 'did this actually 
                 (unless (= (aref src (+ row sx)) (aref prev (+ row sx)))
                   (return-from %mb-unchanged-p nil))))))))))
 
-(defun %code-inter-plane (tw probs src sw sh ref rw ox oy size dcq acq above left ai0 li0 blocks)
+(defun %code-inter-plane (tw probs src sw sh ref rw ox oy size dcq acq above left ai0 li0 blocks
+                          blk co q dq rec)
   "Residual-code one plane region against the reference (ZEROMV: prediction is the co-located
 pixels).  Returns T if anything was coded.  BLOCKS is 4 (chroma 8x8) or ignored for luma."
-  (declare (ignore blocks))
-  (let ((any nil) (blk (mkblk)) (co (mkblk)) (q (mkblk)) (dq (mkblk)) (rec (mkblk))
-        (n (floor size 4)))
+  (declare (ignore blocks)
+           (type (simple-array (unsigned-byte 8) (*)) src ref)
+           (type (simple-array (signed-byte 32) (16)) blk co q dq rec)
+           (type fixnum sw sh rw ox oy size ai0 li0)
+           (type (integer 1 4096) dcq acq)
+           (optimize (speed 3) (safety 0)))
+  (let ((any nil) (n (floor size 4)))
     (dotimes (b (* n n))
       (let* ((bx (+ ox (* 4 (mod b n)))) (by (+ oy (* 4 (floor b n)))))
         (dotimes (i 16)
@@ -109,18 +122,26 @@ place.  Every macroblock is ZEROMV/LAST; unchanged ones are skipped outright.  D
 is a per-macroblock bit vector of what the capture reported as updated — macroblocks it clears are
 skipped without touching a pixel, which is far cheaper than rediscovering that by comparison.
 Returns (values bytes coded-mb-count)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) y u v)
+           (optimize (speed 3) (safety 1)))
   (let* ((mc (ve-mb-cols enc)) (mr (ve-mb-rows enc))
          (w (ve-width enc)) (h (ve-height enc))
          (sw (ceiling w 2)) (sh (ceiling h 2))
          (pw (ve-pw enc)) (cw (ve-cw enc))
-         (ry (ve-ref-y enc)) (ru (ve-ref-u enc)) (rv (ve-ref-v enc))
+         (ry (the (simple-array (unsigned-byte 8) (*)) (ve-ref-y enc)))
+         (ru (the (simple-array (unsigned-byte 8) (*)) (ve-ref-u enc)))
+         (rv (the (simple-array (unsigned-byte 8) (*)) (ve-ref-v enc)))
          (bw (make-bwriter)) (tw (make-bwriter)) (probs +default-coef-probs+)
          (dcq (dc-quant qi)) (acq (ac-quant qi))
          (y2dcq (y2-dc-quant qi)) (y2acq (y2-ac-quant qi))
          (uvdcq (min 132 (dc-quant qi))) (uvacq (ac-quant qi))
          (ctxs (make-contexts mc)) (coded 0)
          (blk (mkblk)) (co (mkblk)) (y2in (mkblk)) (y2co (mkblk)) (y2q (mkblk))
-         (dq (mkblk)) (rec (mkblk)))
+         (dq (mkblk)) (rec (mkblk)) (y2dq (mkblk)) (y2r (mkblk))
+         ;; scratch reused for every macroblock: this loop used to cons ~30 short arrays per
+         ;; macroblock, which at 4000 macroblocks is ~120k allocations (and the GC churn) a frame
+         (cblk (mkblk)) (cco (mkblk)) (cq (mkblk)) (cdq (mkblk)) (crec (mkblk))
+         (acs (let ((a (make-array 16))) (dotimes (i 16 a) (setf (aref a i) (mkblk))))))
     ;; ---- frame header (inter variant, RFC 6386 s9) ----
     (bwrite-literal bw 0 1)                      ; segmentation_enabled
     (bwrite-literal bw 0 1)                      ; filter_type
@@ -181,7 +202,7 @@ Returns (values bytes coded-mb-count)."
             (t
              (incf coded)
              ;; luma: residual against the co-located reference pixels, Y2 over the sixteen DCs
-             (let ((acs (make-array 16)) (dcs (make-array 16 :element-type '(signed-byte 32))))
+             (let ((dcs (make-array 16 :element-type '(signed-byte 32))))
                (dotimes (b 16)
                  (let ((bx (+ ox (* 4 (mod b 4)))) (by (+ oy (* 4 (floor b 4)))))
                    (dotimes (i 16)
@@ -190,7 +211,7 @@ Returns (values bytes coded-mb-count)."
                                              (aref ry (+ (* (+ by (floor i 4)) pw) (+ bx (mod i 4))))))))
                    (fdct4x4 blk co)
                    (setf (aref dcs b) (aref co 0))
-                   (let ((q (mkblk))) (zigzag-quantize co q dcq acq :first 1) (setf (aref acs b) q))))
+                   (zigzag-quantize co (aref acs b) dcq acq :first 1)))
                (dotimes (i 16) (setf (aref y2in i) (aref dcs i)))
                (fwht4x4 y2in y2co)
                (zigzag-quantize y2co y2q y2dcq y2acq)
@@ -204,9 +225,11 @@ Returns (values bytes coded-mb-count)."
                    (setf (aref (ec-above-y ctxs) (+ (* 4 mbx) bc)) (if nz 1 0)
                          (aref (ec-left-y ctxs) br) (if nz 1 0))))
                ;; reconstruct luma into the reference
-               (let ((y2dq (mkblk)) (y2r (mkblk)))
+               (progn
                  (dotimes (i 16) (setf (aref y2dq i) (* (aref y2q i) (if (zerop i) y2dcq y2acq))))
-                 (dotimes (i 16) (setf (aref y2in i) (aref y2dq (position i +zigzag+))))
+                 ;; scatter by zigzag index rather than searching for each raster index (was O(16) per
+                 ;; coefficient, i.e. 256 searches per macroblock)
+                 (dotimes (j 16) (setf (aref y2in (aref +zigzag+ j)) (aref y2dq j)))
                  (iwht4x4 y2in y2r)
                  (dotimes (b 16)
                    (let ((q (aref acs b)) (bx (+ ox (* 4 (mod b 4)))) (by (+ oy (* 4 (floor b 4)))))
@@ -218,9 +241,11 @@ Returns (values bytes coded-mb-count)."
                          (setf (aref ry o) (max 0 (min 255 (+ (aref ry o) (aref rec i)))))))))))
              ;; chroma
              (%code-inter-plane tw probs u sw sh ru cw cx cy 8 uvdcq uvacq
-                                (ec-above-u ctxs) (ec-left-u ctxs) (* 2 mbx) 0 4)
+                                (ec-above-u ctxs) (ec-left-u ctxs) (* 2 mbx) 0 4
+                                cblk cco cq cdq crec)
              (%code-inter-plane tw probs v sw sh rv cw cx cy 8 uvdcq uvacq
-                                (ec-above-v ctxs) (ec-left-v ctxs) (* 2 mbx) 0 4))))))
+                                (ec-above-v ctxs) (ec-left-v ctxs) (* 2 mbx) 0 4
+                                cblk cco cq cdq crec))))))
     ;; this frame's source becomes the baseline for deciding what changed next time
     (replace (ve-prev-y enc) y) (replace (ve-prev-u enc) u) (replace (ve-prev-v enc) v)
     (setf (ve-have-ref enc) t)

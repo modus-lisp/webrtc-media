@@ -13,7 +13,10 @@
 ;;; ---- forward DCT (vp8_short_fdct4x4_c) -------------------------------------
 (defun fdct4x4 (in out)
   "Forward VP8 4x4 DCT.  IN 16 residual samples (row-major), OUT 16 coefficients."
+  (declare (type (simple-array (signed-byte 32) (16)) in out)
+           (optimize (speed 3) (safety 0)))
   (let ((tmp (mkblk)))
+    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 32) (16)) tmp))
     (dotimes (i 4)                                     ; pass 1: rows
       (let* ((o (* i 4))
              (a1 (* 8 (+ (aref in (+ o 0)) (aref in (+ o 3)))))
@@ -39,7 +42,10 @@
 (defconstant +c1const+ 20091)   ; cospi8sqrt2minus1
 (defconstant +c2const+ 35468)   ; sinpi8sqrt2
 (defun idct4x4 (in out)
+  (declare (type (simple-array (signed-byte 32) (16)) in out)
+           (optimize (speed 3) (safety 0)))
   (let ((tmp (mkblk)))
+    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 32) (16)) tmp))
     (dotimes (i 4)                                     ; columns
       (let* ((i0 (aref in i)) (i4 (aref in (+ i 4))) (i8 (aref in (+ i 8))) (i12 (aref in (+ i 12)))
              (a1 (+ i0 i8)) (b1 (- i0 i8))
@@ -60,7 +66,10 @@
 ;;; ---- forward / inverse Walsh-Hadamard (Y2) --------------------------------
 (defun fwht4x4 (in out)
   "Forward VP8 Walsh-Hadamard of the 16 luma DC values (vp8_short_walsh4x4_c)."
+  (declare (type (simple-array (signed-byte 32) (16)) in out)
+           (optimize (speed 3) (safety 0)))
   (let ((tmp (mkblk)))
+    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 32) (16)) tmp))
     (dotimes (i 4)
       (let* ((o (* i 4))
              (a1 (* 4 (+ (aref in (+ o 0)) (aref in (+ o 2)))))
@@ -83,7 +92,10 @@
     out))
 
 (defun iwht4x4 (in out)
+  (declare (type (simple-array (signed-byte 32) (16)) in out)
+           (optimize (speed 3) (safety 0)))
   (let ((tmp (mkblk)))
+    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 32) (16)) tmp))
     (dotimes (i 4)
       (let* ((a1 (+ (aref in (+ i 0)) (aref in (+ i 12)))) (b1 (+ (aref in (+ i 4)) (aref in (+ i 8))))
              (c1 (- (aref in (+ i 4)) (aref in (+ i 8)))) (d1 (- (aref in (+ i 0)) (aref in (+ i 12)))))

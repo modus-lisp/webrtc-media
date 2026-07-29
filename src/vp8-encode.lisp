@@ -78,6 +78,9 @@ previous token was DCT_0, and its encoder mirrors that with skip_eob_node = (pt 
 
 (defun zigzag-quantize (coeffs out dcq acq &key (first 0))
   "Quantize COEFFS (raster 4x4 order) into OUT in ZIGZAG order.  Positions below FIRST are zeroed."
+  (declare (type (simple-array (signed-byte 32) (16)) coeffs out)
+           (type (integer 1 4096) dcq acq) (type (integer 0 16) first)
+           (optimize (speed 3) (safety 0)))
   (dotimes (i 16 out)
     (let* ((src (aref +zigzag+ i))
            (q (if (zerop i) dcq acq))
@@ -192,7 +195,9 @@ Returns (values frame-bytes luma-reconstruction)."
             (dotimes (i 16)
               (setf (aref y2dq i) (* (aref y2q i) (if (zerop i) y2dcq y2acq))))
             (let ((y2r (mkblk)))
-              (dotimes (i 16) (setf (aref y2in i) (aref y2dq (position i +zigzag+))))
+              ;; scatter by zigzag index rather than searching for each raster index (was O(16) per
+                 ;; coefficient, i.e. 256 searches per macroblock)
+                 (dotimes (j 16) (setf (aref y2in (aref +zigzag+ j)) (aref y2dq j)))
               (iwht4x4 y2in y2r)
               (dotimes (b 16)
                 (let ((q (aref acq-blocks b)))
