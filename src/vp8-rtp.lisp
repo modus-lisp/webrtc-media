@@ -24,11 +24,13 @@
   (when (> ms (ps-max st)) (setf (ps-max st) ms)))
 
 (defmacro with-timing ((st) &body body)
-  (let ((t0 (gensym)) (r (gensym)))
-    `(let* ((,t0 (get-internal-real-time)) (,r (progn ,@body)))
-       (ps-note ,st (/ (* 1000d0 (- (get-internal-real-time) ,t0))
-                       internal-time-units-per-second))
-       ,r)))
+  "Time BODY and return ALL of its values — multiple-value-prog1, not a let: the frame source
+returns (values y u v w h dirty), and collapsing that to one value silently nils the rest."
+  (let ((t0 (gensym)))
+    `(let ((,t0 (get-internal-real-time)))
+       (multiple-value-prog1 (progn ,@body)
+         (ps-note ,st (/ (* 1000d0 (- (get-internal-real-time) ,t0))
+                         internal-time-units-per-second))))))
 
 (defun ps-line (st)
   (if (zerop (ps-n st)) (format nil "~a: -" (ps-name st))
