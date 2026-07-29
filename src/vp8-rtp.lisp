@@ -12,6 +12,30 @@
 (in-package #:webrtc-media)
 
 (defconstant +vp8-rtp-clock+ 90000)
+
+;;; ---- pipeline timing -------------------------------------------------------
+;;; Choppiness can come from anywhere in capture -> convert -> encode -> send, and guessing which
+;;; is expensive.  Each stage keeps min/max/mean so a report says where the time actually goes.
+(defstruct (pstat (:conc-name ps-)) (name "") (n 0) (min 1d9) (max 0d0) (total 0d0))
+
+(defun ps-note (st ms)
+  (incf (ps-n st)) (incf (ps-total st) ms)
+  (when (< ms (ps-min st)) (setf (ps-min st) ms))
+  (when (> ms (ps-max st)) (setf (ps-max st) ms)))
+
+(defmacro with-timing ((st) &body body)
+  (let ((t0 (gensym)) (r (gensym)))
+    `(let* ((,t0 (get-internal-real-time)) (,r (progn ,@body)))
+       (ps-note ,st (/ (* 1000d0 (- (get-internal-real-time) ,t0))
+                       internal-time-units-per-second))
+       ,r)))
+
+(defun ps-line (st)
+  (if (zerop (ps-n st)) (format nil "~a: -" (ps-name st))
+      (format nil "~a ~,1f/~,1f/~,1f" (ps-name st)
+              (ps-min st) (/ (ps-total st) (ps-n st)) (ps-max st))))
+
+(defun ps-reset (st) (setf (ps-n st) 0 (ps-min st) 1d9 (ps-max st) 0d0 (ps-total st) 0d0))
 (defparameter *vp8-max-payload* 1100)     ; keep the whole SRTP packet under a safe path MTU
 
 (defun vp8-packetize (frame seq ts ssrc pt &key (max-payload *vp8-max-payload*))
@@ -43,10 +67,14 @@ where an unchanged macroblock costs a single bit.  Returns a STOP thunk."
   (let ((running t))
     (bt:make-thread
      (lambda ()
-       (let ((seq 0) (ts 0) (n 0) (sent 0) (enc nil))
+       (let ((seq 0) (ts 0) (n 0) (sent 0) (enc nil) (skipped 0)
+             (st-take (make-pstat :name "take")) (st-enc (make-pstat :name "encode"))
+             (st-send (make-pstat :name "send")) (st-loop (make-pstat :name "loop"))
+             (last-report (get-internal-real-time)) (bytes 0))
          (loop while running do
            (handler-case
-               (multiple-value-bind (y u v w h dirty) (if source (funcall source) (values nil nil nil nil nil nil))
+               (multiple-value-bind (y u v w h dirty)
+                   (with-timing (st-take) (if source (funcall source) (values nil nil nil nil nil nil)))
                  (let* ((need-key (or (null enc) (zerop (mod n key-interval))))
                         (frame
                           (cond
@@ -65,16 +93,24 @@ where an unchanged macroblock costs a single bit.  Returns a STOP thunk."
                                (setf (vp8::ve-have-ref enc) t)
                                f))
                             ;; otherwise an inter frame: unchanged macroblocks are one skip bit
-                            (t (vp8::encode-inter-frame enc y u v :qi qi :dirty dirty)))))
-                   (when frame
-                     (multiple-value-bind (pkts next) (vp8-packetize frame seq ts ssrc pt)
-                       (setf seq next)
-                       (dolist (p pkts)
-                         (webrtc-data:ice-send-to-peer agent (srtp-protect ctx p)))
-                       (incf sent)
-                       (when (and log (zerop (mod sent 10)))
-                         (funcall log (format nil "video: frame ~a, ~,1f KB, ~a pkts"
-                                              sent (/ (length frame) 1024.0) (length pkts))))))
+                            (t (with-timing (st-enc) (vp8::encode-inter-frame enc y u v :qi qi :dirty dirty))))))
+                   (if frame
+                       (with-timing (st-send)
+                         (multiple-value-bind (pkts next) (vp8-packetize frame seq ts ssrc pt)
+                           (setf seq next)
+                           (dolist (p pkts)
+                             (webrtc-data:ice-send-to-peer agent (srtp-protect ctx p)))
+                           (incf sent) (incf bytes (length frame))))
+                       (incf skipped))
+                   ;; every ~5 s: min/mean/max per stage, so choppiness can be attributed
+                   (let ((dt (/ (* 1000d0 (- (get-internal-real-time) last-report))
+                                internal-time-units-per-second)))
+                     (when (and log (> dt 5000))
+                       (funcall log (format nil "~a | ~a | ~a | sent ~a idle ~a | ~,1f KB/s | ~,1f fps"
+                                            (ps-line st-take) (ps-line st-enc) (ps-line st-send)
+                                            sent skipped (/ bytes 1.024 dt) (/ (* 1000d0 sent) dt)))
+                       (ps-reset st-take) (ps-reset st-enc) (ps-reset st-send) (ps-reset st-loop)
+                       (setf sent 0 skipped 0 bytes 0 last-report (get-internal-real-time))))
                    (incf n)
                    (incf ts (floor +vp8-rtp-clock+ fps))))
              (error (e) (when log (funcall log (format nil "video tx: ~a" e)))))
