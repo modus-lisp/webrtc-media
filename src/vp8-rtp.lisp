@@ -58,7 +58,7 @@ SEQ is the starting sequence number; returns (values packets next-seq)."
     (values (nreverse out) s)))
 
 (defun start-video (agent session ctx &key (pt 96) (width 64) (height 64) (fps 5)
-                                           (ssrc #x5e5e0001) (qi 12) (key-interval 120) source log)
+                                           (ssrc #x5e5e0001) (qi 12) (key-interval 120) (poll-secs 0.010) source log)
   "Stream VP8 keyframes to the peer over SRTP.  CTX is the SRTP context (shared with audio — same
 DTLS keys, different SSRC).  SOURCE, when given, is a thunk returning (values Y U V w h) for the
 next frame or NIL if nothing changed since last time — so an idle screen costs no bandwidth.
@@ -72,7 +72,7 @@ where an unchanged macroblock costs a single bit.  Returns a STOP thunk."
        (let ((seq 0) (ts 0) (n 0) (sent 0) (enc nil) (skipped 0)
              (st-take (make-pstat :name "take")) (st-enc (make-pstat :name "encode"))
              (st-send (make-pstat :name "send")) (st-loop (make-pstat :name "loop"))
-             (last-report (get-internal-real-time)) (bytes 0))
+             (last-report (get-internal-real-time)) (last-tick (get-internal-real-time)) (bytes 0))
          (loop while running do
            (handler-case
                (multiple-value-bind (y u v w h dirty)
@@ -114,8 +114,16 @@ where an unchanged macroblock costs a single bit.  Returns a STOP thunk."
                        (ps-reset st-take) (ps-reset st-enc) (ps-reset st-send) (ps-reset st-loop)
                        (setf sent 0 skipped 0 bytes 0 last-report (get-internal-real-time))))
                    (incf n)
-                   (incf ts (floor +vp8-rtp-clock+ fps))))
+                   ;; advance the RTP clock by time actually elapsed: frames appear when the
+                   ;; desktop changes, not on a fixed cadence, so a nominal 1/fps step would drift
+                   (let ((now (get-internal-real-time)))
+                     (incf ts (max 1 (floor (* +vp8-rtp-clock+ (- now last-tick))
+                                            internal-time-units-per-second)))
+                     (setf last-tick now))))
              (error (e) (when log (funcall log (format nil "video tx: ~a" e)))))
-           (sleep (/ 1.0 fps)))))
+           ;; poll on a short tick rather than 1/fps: capture-take returns NIL when nothing
+           ;; changed (cheap), so this only affects how quickly a change is noticed, and the
+           ;; encode itself is what paces us on a busy screen.
+           (sleep poll-secs))))
      :name "wm-video-tx")
     (lambda () (setf running nil))))
