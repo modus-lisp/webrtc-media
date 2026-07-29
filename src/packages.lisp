@@ -12,8 +12,12 @@
 (defpackage #:webrtc-media
   (:use #:cl)
   (:nicknames #:wm)
+  ;; G.711 (PCMU/PCMA companding) now lives in reed, the pure-CL audio-codec
+  ;; library.  Import its entry points and re-export them so wm's public API is
+  ;; unchanged (wm:pcmu-encode etc. are reed's symbols).
+  (:import-from #:reed #:pcmu-encode #:pcmu-decode #:pcma-encode #:pcma-decode)
   (:export
-   ;; G.711 codec (operate on (signed-byte 16) PCM <-> (unsigned-byte 8) codewords)
+   ;; G.711 codec (re-exported from reed; (signed-byte 16) PCM <-> (unsigned-byte 8) codewords)
    #:pcmu-encode #:pcmu-decode #:pcma-encode #:pcma-decode
    ;; RTP
    #:rtp #:make-rtp #:rtp-pack #:rtp-parse
