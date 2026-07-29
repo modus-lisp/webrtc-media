@@ -10,7 +10,9 @@
   (:use #:cl)
   (:nicknames #:vp8)
   (:export #:make-bwriter #:bwrite-bit #:bwrite-literal #:bwrite-flag #:bwrite-finish
-           #:make-breader* #:bread-bit #:bread-literal #:bread-flag))
+           #:make-breader* #:bread-bit #:bread-literal #:bread-flag
+           ;; encoder entry points
+           #:encode-gray-frame #:encode-keyframe-gray #:encode-keyframe-checker #:parse-keyframe))
 
 (in-package #:webrtc-media.vp8)
 

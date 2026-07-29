@@ -3,8 +3,9 @@
 ;;;; This is the layer that ties the pure media plane (g711/rtp/srtp) to the live connection:
 ;;;; derive SRTP keys from the finished DTLS handshake, install an ON-MEDIA handler that
 ;;;; decrypts+decodes inbound RTP (reporting a level), and run a sender thread.  For the first
-;;;; bring-up the sender is a *fake source* — a beeping tone — so we can prove the channel end to
-;;;; end before wiring a real capture/playback device on the box.
+;;;; bring-up the sender was a *fake source* — a beeping tone — to prove the channel end to end.
+;;;; That is done, so the default is now silence (:tone t restores the beep) until a real audio
+;;;; device on the box feeds it.
 
 (in-package #:webrtc-media)
 
@@ -17,11 +18,13 @@
     (dotimes (i n) (let ((s (aref pcm i))) (incf sum (* (float s 1d0) s))))
     (min 1d0 (/ (sqrt (/ sum (max 1 n))) 8000d0))))
 
-(defun start-audio (agent session &key on-rx-level on-tx-level (tone-hz 880d0) (ssrc #x1a2b3c4d) log)
+(defun start-audio (agent session &key on-rx-level on-tx-level (tone-hz 880d0) (ssrc #x1a2b3c4d)
+                                       (tone nil) log)
   "Wire full-duplex G.711/SRTP audio onto webrtc-data AGENT and its finished DTLS SESSION.
 Installs an ON-MEDIA handler that decrypts+decodes inbound SRTP (calling ON-RX-LEVEL with a
-0-1 level), and spawns a sender thread emitting a beeping PCMU tone (ON-TX-LEVEL per frame).
-Returns a STOP thunk."
+0-1 level).  The outbound side sends PCMU silence, keeping the stream (and its timing) alive
+without making noise; TONE t restores the bring-up beep, which was only ever a liveness probe.
+Returns (values stop-thunk srtp-context)."
   (let ((ctx (srtp-context-from-dtls session :role :client))
         (running t))
     ;; inbound: SRTP -> RTP -> PCMU -> level  (with bring-up diagnostics)
@@ -40,7 +43,8 @@ Returns a STOP thunk."
                       (t (incf bad)
                          (when (and log (= bad 1)) (funcall log "rx: SRTP arriving but DECRYPT FAILS -> keying mismatch")))))
                 (error (e) (when log (funcall log (format nil "audio rx err: ~a" e))))))))
-    ;; outbound: a beeping 880 Hz tone (fake source) — ~160 ms on every 600 ms
+    ;; outbound: PCMU silence by default (keeps the stream + its clock alive); :tone t
+    ;; brings back the 880 Hz bring-up beep
     (bt:make-thread
      (lambda ()
        (let ((seq 0) (ts 0) (frame 0) (phase 0d0)
@@ -48,7 +52,7 @@ Returns a STOP thunk."
              (pcm (make-array +audio-frame-samples+ :element-type '(signed-byte 16))))
          (loop while running do
            (handler-case
-               (let ((beep (< (mod frame 30) 8)))
+               (let ((beep (and tone (< (mod frame 30) 8))))
                  (dotimes (i +audio-frame-samples+)
                    (setf (aref pcm i) (if beep (round (* 9000d0 (sin phase))) 0))
                    (incf phase dphase) (when (> phase (* 2d0 pi)) (decf phase (* 2d0 pi))))
