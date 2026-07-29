@@ -45,6 +45,9 @@
   (prev-y nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (prev-u nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (prev-v nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  ;; macroblocks last coded at a degraded quantizer.  When the screen goes quiet we re-code just
+  ;; these at a low qi, so a burst of motion leaves no lasting mush behind.
+  (stale-mbs nil :type (or null simple-bit-vector))
   (have-ref nil) (frames 0))
 
 (defun make-encoder (width height)
@@ -56,7 +59,8 @@
                :ref-v (make-array (* cw chh) :element-type '(unsigned-byte 8) :initial-element 128)
                :prev-y (make-array (* width height) :element-type '(unsigned-byte 8) :initial-element 0)
                :prev-u (make-array (* (ceiling width 2) (ceiling height 2)) :element-type '(unsigned-byte 8) :initial-element 0)
-               :prev-v (make-array (* (ceiling width 2) (ceiling height 2)) :element-type '(unsigned-byte 8) :initial-element 0))))
+               :prev-v (make-array (* (ceiling width 2) (ceiling height 2)) :element-type '(unsigned-byte 8) :initial-element 0)
+               :stale-mbs (make-array (* mc mr) :element-type 'bit :initial-element 0))))
 
 (defun %mv-ref-p0 (mbx mby)
   "Probability for the ZEROMV branch of vp8_mv_ref_tree at this macroblock (see file header)."
@@ -116,11 +120,16 @@ pixels).  Returns T if anything was coded.  BLOCKS is 4 (chroma 8x8) or ignored 
                   (max 0 (min 255 (+ (aref ref (+ (* py rw) px)) (aref rec i)))))))))
     any))
 
-(defun encode-inter-frame (enc y u v &key (qi 12) dirty)
+(defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12))
   "Encode one inter frame of Y/U/V against the encoder's reference, updating the reference in
 place.  Every macroblock is ZEROMV/LAST; unchanged ones are skipped outright.  DIRTY, when given,
 is a per-macroblock bit vector of what the capture reported as updated — macroblocks it clears are
 skipped without touching a pixel, which is far cheaper than rediscovering that by comparison.
+
+FORCE codes every macroblock DIRTY selects even if its pixels are unchanged: that is the idle
+refinement pass, which re-codes at a low qi whatever was last coded coarsely (the residual against
+the existing reference sharpens the decoder's copy).  Macroblocks coded above CLEAN-QI are
+recorded in the encoder's stale set; those at or below it are cleared.
 Returns (values bytes coded-mb-count)."
   (declare (type (simple-array (unsigned-byte 8) (*)) y u v)
            (optimize (speed 3) (safety 1)))
@@ -179,7 +188,9 @@ Returns (values bytes coded-mb-count)."
         (let* ((ox (* mbx 16)) (oy (* mby 16))
                (cx (* mbx 8)) (cy (* mby 8))
                (mbi (+ (* mby mc) mbx))
+               (forced (and force dirty (= 1 (aref (the simple-bit-vector dirty) mbi))))
                (skip (and (ve-have-ref enc)
+                          (not forced)
                           (or (and dirty (zerop (aref (the simple-bit-vector dirty) mbi)))
                               (and (%mb-unchanged-p y (ve-prev-y enc) w h ox oy 16)
                                    (%mb-unchanged-p u (ve-prev-u enc) sw sh cx cy 8)
@@ -201,6 +212,8 @@ Returns (values bytes coded-mb-count)."
              (setf (aref (ec-above-y2 ctxs) mbx) 0 (ec-left-y2 ctxs) 0))
             (t
              (incf coded)
+             (let ((st (ve-stale-mbs enc)))
+               (when st (setf (aref st mbi) (if (> qi clean-qi) 1 0))))
              ;; luma: residual against the co-located reference pixels, Y2 over the sixteen DCs
              (let ((dcs (make-array 16 :element-type '(signed-byte 32))))
                (dotimes (b 16)
