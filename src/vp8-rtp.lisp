@@ -60,7 +60,7 @@ SEQ is the starting sequence number; returns (values packets next-seq)."
 (defun start-video (agent session ctx &key (pt 96) (width 64) (height 64) (fps 5)
                                            (ssrc #x5e5e0001) (qi 12) (key-interval 120) (poll-secs 0.010)
                                            (max-qi 44) (target-kbs 150) (cleanup-ms 700)
-                                           (max-frame-kb 24) source log)
+                                           (max-frame-kb 32) source log)
   "Stream VP8 keyframes to the peer over SRTP.  CTX is the SRTP context (shared with audio — same
 DTLS keys, different SSRC).  SOURCE, when given, is a thunk returning (values Y U V w h) for the
 next frame or NIL if nothing changed since last time — so an idle screen costs no bandwidth.
@@ -104,28 +104,42 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                                  (if (evenp (floor n 3))
                                      (vp8::encode-keyframe-gray width height)
                                      (vp8::encode-keyframe-checker width height :phase 1))
-                                 ;; nothing changed.  If the screen has been quiet a moment and we
-                                 ;; owe a refinement, re-code the coarsely-coded macroblocks at the
-                                 ;; best qi: the residual against the existing reference sharpens
-                                 ;; the decoder's copy without anything having moved.
-                                 (let ((st (and enc (vp8::ve-stale-mbs enc))))
-                                   (when (and st (position 1 st)
-                                              (> (/ (* 1000d0 (- (get-internal-real-time) idle-since))
-                                                    internal-time-units-per-second)
-                                                 cleanup-ms))
-                                     (incf cleanups)
-                                     (setf cur-qi qi)
-                                     (ps-note st-mbs (count 1 st))
-                                     (with-timing (st-clean)
-                                       (vp8::encode-inter-frame enc (vp8::ve-prev-y enc)
-                                                                (vp8::ve-prev-u enc) (vp8::ve-prev-v enc)
-                                                                :qi qi :dirty (copy-seq st)
-                                                                :force t :clean-qi qi
-                                                                ;; budget the refinement too: an
-                                                                ;; uncoded macroblock stays stale,
-                                                                ;; so it simply resumes next pass
-                                                                :max-mbs (max 48 (floor (* max-frame-kb 1024)
-                                                                                        (max 1d0 bpm)))))))))
+                                 ;; Nothing new from the desktop.  Two jobs can still be owed, in
+                                 ;; this order:
+                                 ;;   1. deferred macroblocks — content the viewer has NOT been
+                                 ;;      shown yet because it did not fit in earlier frames.  This
+                                 ;;      must drain here: once the drag stops there are no more
+                                 ;;      source frames, and without this the un-sent remainder of
+                                 ;;      the damaged area never arrives at all.
+                                 ;;   2. refinement — re-code coarsely-coded macroblocks at the
+                                 ;;      best qi once the screen has been quiet a moment.
+                                 (let ((st (and enc (vp8::ve-stale-mbs enc)))
+                                       (budget (max 128 (floor (* max-frame-kb 1024) (max 1d0 bpm)))))
+                                   (cond
+                                     ((and enc pending (position 1 pending))
+                                      (multiple-value-bind (f nmb defer)
+                                          (with-timing (st-enc)
+                                            (vp8::encode-inter-frame
+                                             enc (vp8::ve-prev-y enc) (vp8::ve-prev-u enc)
+                                             (vp8::ve-prev-v enc)
+                                             :qi cur-qi :dirty pending :force t :clean-qi qi
+                                             :max-mbs budget))
+                                        (setf pending defer)
+                                        (when nmb (ps-note st-mbs nmb))
+                                        f))
+                                     ((and st (position 1 st)
+                                           (> (/ (* 1000d0 (- (get-internal-real-time) idle-since))
+                                                 internal-time-units-per-second)
+                                              cleanup-ms))
+                                      (incf cleanups)
+                                      (setf cur-qi qi)
+                                      (ps-note st-mbs (count 1 st))
+                                      (with-timing (st-clean)
+                                        (vp8::encode-inter-frame enc (vp8::ve-prev-y enc)
+                                                                 (vp8::ve-prev-u enc) (vp8::ve-prev-v enc)
+                                                                 :qi qi :dirty (copy-seq st)
+                                                                 :force t :clean-qi qi
+                                                                 :max-mbs budget)))))))
                             ;; first frame, or a periodic refresh: keyframe, and it seeds the
                             ;; reference the following inter frames predict from
                             ((or need-key (/= w (vp8::ve-width enc)) (/= h (vp8::ve-height enc)))
@@ -145,7 +159,7 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                                      (with-timing (st-enc)
                                        (vp8::encode-inter-frame
                                         enc y u v :qi cur-qi :dirty want :force t :clean-qi qi
-                                        :max-mbs (max 48 (floor (* max-frame-kb 1024) (max 1d0 bpm)))))
+                                        :max-mbs (max 128 (floor (* max-frame-kb 1024) (max 1d0 bpm)))))
                                    (setf pending defer)
                                    (when nmb
                                      (ps-note st-mbs nmb)
