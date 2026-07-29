@@ -59,7 +59,8 @@ SEQ is the starting sequence number; returns (values packets next-seq)."
 
 (defun start-video (agent session ctx &key (pt 96) (width 64) (height 64) (fps 5)
                                            (ssrc #x5e5e0001) (qi 12) (key-interval 120) (poll-secs 0.010)
-                                           (max-qi 44) (target-kbs 150) (cleanup-ms 400) source log)
+                                           (max-qi 44) (target-kbs 150) (cleanup-ms 700)
+                                           (max-frame-kb 24) source log)
   "Stream VP8 keyframes to the peer over SRTP.  CTX is the SRTP context (shared with audio — same
 DTLS keys, different SSRC).  SOURCE, when given, is a thunk returning (values Y U V w h) for the
 next frame or NIL if nothing changed since last time — so an idle screen costs no bandwidth.
@@ -78,9 +79,19 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
        (let ((seq 0) (ts 0) (n 0) (sent 0) (enc nil) (skipped 0)
              (st-take (make-pstat :name "take")) (st-enc (make-pstat :name "encode"))
              (st-send (make-pstat :name "send")) (st-loop (make-pstat :name "loop"))
+             ;; the adaptive path gets its own counters: a refinement is a different animal from a
+             ;; live frame, and per-FRAME size matters as much as average rate — one 90 KB frame is
+             ;; ~360 ms of transmission on a 250 KB/s link, which reads as a freeze no matter what
+             ;; the 5-second average says.
+             (st-clean (make-pstat :name "refine")) (st-kb (make-pstat :name "frameKB"))
+             (st-mbs (make-pstat :name "codedMB")) (st-qi (make-pstat :name "qi"))
+             (st-lag (make-pstat :name "lag"))
              (last-report (get-internal-real-time)) (last-tick (get-internal-real-time)) (bytes 0)
              (cur-qi qi) (rc-bytes 0) (rc-since (get-internal-real-time))
-             (idle-since (get-internal-real-time)) (cleanups 0))
+             (idle-since (get-internal-real-time)) (cleanups 0)
+             ;; macroblocks that wanted coding but did not fit in a frame's byte budget, carried
+             ;; forward so a big change refreshes progressively instead of in one huge frame
+             (pending nil) (bpm 110d0))
          (loop while running do
            (handler-case
                (multiple-value-bind (y u v w h dirty)
@@ -104,11 +115,17 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                                                  cleanup-ms))
                                      (incf cleanups)
                                      (setf cur-qi qi)
-                                     (with-timing (st-enc)
+                                     (ps-note st-mbs (count 1 st))
+                                     (with-timing (st-clean)
                                        (vp8::encode-inter-frame enc (vp8::ve-prev-y enc)
                                                                 (vp8::ve-prev-u enc) (vp8::ve-prev-v enc)
                                                                 :qi qi :dirty (copy-seq st)
-                                                                :force t :clean-qi qi))))))
+                                                                :force t :clean-qi qi
+                                                                ;; budget the refinement too: an
+                                                                ;; uncoded macroblock stays stale,
+                                                                ;; so it simply resumes next pass
+                                                                :max-mbs (max 48 (floor (* max-frame-kb 1024)
+                                                                                        (max 1d0 bpm)))))))))
                             ;; first frame, or a periodic refresh: keyframe, and it seeds the
                             ;; reference the following inter frames predict from
                             ((or need-key (/= w (vp8::ve-width enc)) (/= h (vp8::ve-height enc)))
@@ -121,16 +138,29 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                                f))
                             ;; otherwise an inter frame: unchanged macroblocks are one skip bit
                             (t (setf idle-since (get-internal-real-time))
-                               (with-timing (st-enc)
-                                 (vp8::encode-inter-frame enc y u v :qi cur-qi :dirty dirty
-                                                          :clean-qi qi))))))
+                               (let ((want (cond ((null pending) dirty)
+                                                 ((null dirty) pending)
+                                                 (t (bit-ior pending dirty)))))
+                                 (multiple-value-bind (f nmb defer)
+                                     (with-timing (st-enc)
+                                       (vp8::encode-inter-frame
+                                        enc y u v :qi cur-qi :dirty want :force t :clean-qi qi
+                                        :max-mbs (max 48 (floor (* max-frame-kb 1024) (max 1d0 bpm)))))
+                                   (setf pending defer)
+                                   (when nmb
+                                     (ps-note st-mbs nmb)
+                                     (when (and f (plusp nmb))    ; keep the cost estimate honest
+                                       (setf bpm (+ (* 0.7d0 bpm) (* 0.3d0 (/ (length f) nmb))))))
+                                   f))))))
                    (if frame
                        (with-timing (st-send)
                          (multiple-value-bind (pkts next) (vp8-packetize frame seq ts ssrc pt)
                            (setf seq next)
                            (dolist (p pkts)
                              (webrtc-data:ice-send-to-peer agent (srtp-protect ctx p)))
-                           (incf sent) (incf bytes (length frame)) (incf rc-bytes (length frame))))
+                           (incf sent) (incf bytes (length frame)) (incf rc-bytes (length frame))
+                           (ps-note st-kb (/ (length frame) 1024d0))
+                           (ps-note st-qi cur-qi)))
                        (incf skipped))
                    ;; rate control: every ~500 ms compare the achieved rate with the target and
                    ;; nudge the quantizer.  Coarsening under load keeps latency down instead of
@@ -146,11 +176,13 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                    (let ((dt (/ (* 1000d0 (- (get-internal-real-time) last-report))
                                 internal-time-units-per-second)))
                      (when (and log (> dt 5000))
-                       (funcall log (format nil "~a | ~a | ~a | sent ~a idle ~a | ~,1f KB/s | ~,1f fps | qi ~a | clean ~a"
-                                            (ps-line st-take) (ps-line st-enc) (ps-line st-send)
+                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a | ~,1f KB/s | ~,1f fps | qi ~a b/mb ~,0f | pend ~a | cleans ~a"
+                                            (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
+                                            (ps-line st-send) (ps-line st-kb) (ps-line st-mbs)
                                             sent skipped (/ bytes 1.024 dt) (/ (* 1000d0 sent) dt)
-                                            cur-qi cleanups))
+                                            cur-qi bpm (if pending (count 1 pending) 0) cleanups))
                        (ps-reset st-take) (ps-reset st-enc) (ps-reset st-send) (ps-reset st-loop)
+                       (ps-reset st-clean) (ps-reset st-kb) (ps-reset st-mbs) (ps-reset st-qi) (ps-reset st-lag)
                        (setf sent 0 skipped 0 bytes 0 cleanups 0 last-report (get-internal-real-time))))
                    (incf n)
                    ;; advance the RTP clock by time actually elapsed: frames appear when the

@@ -120,7 +120,7 @@ pixels).  Returns T if anything was coded.  BLOCKS is 4 (chroma 8x8) or ignored 
                   (max 0 (min 255 (+ (aref ref (+ (* py rw) px)) (aref rec i)))))))))
     any))
 
-(defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12))
+(defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12) max-mbs)
   "Encode one inter frame of Y/U/V against the encoder's reference, updating the reference in
 place.  Every macroblock is ZEROMV/LAST; unchanged ones are skipped outright.  DIRTY, when given,
 is a per-macroblock bit vector of what the capture reported as updated — macroblocks it clears are
@@ -130,7 +130,13 @@ FORCE codes every macroblock DIRTY selects even if its pixels are unchanged: tha
 refinement pass, which re-codes at a low qi whatever was last coded coarsely (the residual against
 the existing reference sharpens the decoder's copy).  Macroblocks coded above CLEAN-QI are
 recorded in the encoder's stale set; those at or below it are cleared.
-Returns (values bytes coded-mb-count)."
+
+MAX-MBS bounds how many macroblocks this frame may code.  Beyond it, macroblocks that wanted
+coding are left skipped and reported in the returned DEFERRED bit vector so the caller can carry
+them into the next frame.  That bounds FRAME SIZE, which is what actually bounds latency: one
+143 KB frame is ~570 ms in flight on a 250 KB/s link, and no average-rate control can see that.
+A big change then arrives as a couple of progressive frames instead of one long stall.
+Returns (values bytes coded-mb-count deferred)."
   (declare (type (simple-array (unsigned-byte 8) (*)) y u v)
            (optimize (speed 3) (safety 1)))
   (let* ((mc (ve-mb-cols enc)) (mr (ve-mb-rows enc))
@@ -144,7 +150,7 @@ Returns (values bytes coded-mb-count)."
          (dcq (dc-quant qi)) (acq (ac-quant qi))
          (y2dcq (y2-dc-quant qi)) (y2acq (y2-ac-quant qi))
          (uvdcq (min 132 (dc-quant qi))) (uvacq (ac-quant qi))
-         (ctxs (make-contexts mc)) (coded 0)
+         (ctxs (make-contexts mc)) (coded 0) (deferred nil)
          (blk (mkblk)) (co (mkblk)) (y2in (mkblk)) (y2co (mkblk)) (y2q (mkblk))
          (dq (mkblk)) (rec (mkblk)) (y2dq (mkblk)) (y2r (mkblk))
          ;; scratch reused for every macroblock: this loop used to cons ~30 short arrays per
@@ -189,12 +195,18 @@ Returns (values bytes coded-mb-count)."
                (cx (* mbx 8)) (cy (* mby 8))
                (mbi (+ (* mby mc) mbx))
                (forced (and force dirty (= 1 (aref (the simple-bit-vector dirty) mbi))))
-               (skip (and (ve-have-ref enc)
-                          (not forced)
-                          (or (and dirty (zerop (aref (the simple-bit-vector dirty) mbi)))
-                              (and (%mb-unchanged-p y (ve-prev-y enc) w h ox oy 16)
-                                   (%mb-unchanged-p u (ve-prev-u enc) sw sh cx cy 8)
-                                   (%mb-unchanged-p v (ve-prev-v enc) sw sh cx cy 8))))))
+               (skip0 (and (ve-have-ref enc)
+                           (not forced)
+                           (or (and dirty (zerop (aref (the simple-bit-vector dirty) mbi)))
+                               (and (%mb-unchanged-p y (ve-prev-y enc) w h ox oy 16)
+                                    (%mb-unchanged-p u (ve-prev-u enc) sw sh cx cy 8)
+                                    (%mb-unchanged-p v (ve-prev-v enc) sw sh cx cy 8)))))
+               ;; out of budget: leave it for the next frame rather than growing this one
+               (over (and max-mbs (not skip0) (>= coded (the fixnum max-mbs))))
+               (skip (or skip0 over)))
+          (when over
+            (unless deferred (setf deferred (make-array (* mc mr) :element-type 'bit :initial-element 0)))
+            (setf (aref (the simple-bit-vector deferred) mbi) 1))
           ;; per-MB record: skip flag, then inter / LAST / ZEROMV
           (bwrite-bit bw +prob-skip+ (if skip 1 0))
           (bwrite-bit bw +prob-intra+ 1)                       ; is_inter_mb
@@ -270,4 +282,4 @@ Returns (values bytes coded-mb-count)."
       (vector-push-extend (logand (ash tag -16) #xff) frame)
       (loop for b across p1 do (vector-push-extend b frame))
       (loop for b across p2 do (vector-push-extend b frame))
-      (values frame coded))))
+      (values frame coded deferred))))
