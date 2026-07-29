@@ -62,14 +62,19 @@
 previous one.  Deliberately compares SOURCE to SOURCE, not source to reconstruction: the
 reconstruction is lossy, so comparing against it reports every macroblock as changed and re-codes
 the whole screen every frame.  What we want for a desktop is 'did this actually change'."
+  (declare (type (simple-array (unsigned-byte 8) (*)) src prev)
+           (type fixnum sw sh ox oy size)
+           (optimize (speed 3) (safety 0)))
   (dotimes (r size t)
     (let ((sy (+ oy r)))
       (when (< sy sh)
-        (dotimes (c size)
-          (let ((sx (+ ox c)))
-            (when (< sx sw)
-              (unless (= (aref src (+ (* sy sw) sx)) (aref prev (+ (* sy sw) sx)))
-                (return-from %mb-unchanged-p nil)))))))))
+        (let ((row (* sy sw)))
+          (declare (type fixnum row))
+          (dotimes (c size)
+            (let ((sx (+ ox c)))
+              (when (< sx sw)
+                (unless (= (aref src (+ row sx)) (aref prev (+ row sx)))
+                  (return-from %mb-unchanged-p nil))))))))))
 
 (defun %code-inter-plane (tw probs src sw sh ref rw ox oy size dcq acq above left ai0 li0 blocks)
   "Residual-code one plane region against the reference (ZEROMV: prediction is the co-located
@@ -98,10 +103,12 @@ pixels).  Returns T if anything was coded.  BLOCKS is 4 (chroma 8x8) or ignored 
                   (max 0 (min 255 (+ (aref ref (+ (* py rw) px)) (aref rec i)))))))))
     any))
 
-(defun encode-inter-frame (enc y u v &key (qi 12))
+(defun encode-inter-frame (enc y u v &key (qi 12) dirty)
   "Encode one inter frame of Y/U/V against the encoder's reference, updating the reference in
-place.  Every macroblock is ZEROMV/LAST; unchanged ones are skipped outright.  Returns
-(values bytes coded-mb-count)."
+place.  Every macroblock is ZEROMV/LAST; unchanged ones are skipped outright.  DIRTY, when given,
+is a per-macroblock bit vector of what the capture reported as updated — macroblocks it clears are
+skipped without touching a pixel, which is far cheaper than rediscovering that by comparison.
+Returns (values bytes coded-mb-count)."
   (let* ((mc (ve-mb-cols enc)) (mr (ve-mb-rows enc))
          (w (ve-width enc)) (h (ve-height enc))
          (sw (ceiling w 2)) (sh (ceiling h 2))
@@ -150,10 +157,12 @@ place.  Every macroblock is ZEROMV/LAST; unchanged ones are skipped outright.  R
       (dotimes (mbx mc)
         (let* ((ox (* mbx 16)) (oy (* mby 16))
                (cx (* mbx 8)) (cy (* mby 8))
+               (mbi (+ (* mby mc) mbx))
                (skip (and (ve-have-ref enc)
-                          (%mb-unchanged-p y (ve-prev-y enc) w h ox oy 16)
-                          (%mb-unchanged-p u (ve-prev-u enc) sw sh cx cy 8)
-                          (%mb-unchanged-p v (ve-prev-v enc) sw sh cx cy 8))))
+                          (or (and dirty (zerop (aref (the simple-bit-vector dirty) mbi)))
+                              (and (%mb-unchanged-p y (ve-prev-y enc) w h ox oy 16)
+                                   (%mb-unchanged-p u (ve-prev-u enc) sw sh cx cy 8)
+                                   (%mb-unchanged-p v (ve-prev-v enc) sw sh cx cy 8))))))
           ;; per-MB record: skip flag, then inter / LAST / ZEROMV
           (bwrite-bit bw +prob-skip+ (if skip 1 0))
           (bwrite-bit bw +prob-intra+ 1)                       ; is_inter_mb
