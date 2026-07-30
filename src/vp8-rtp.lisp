@@ -60,7 +60,7 @@ SEQ is the starting sequence number; returns (values packets next-seq)."
 (defun start-video (agent session ctx &key (pt 96) (width 64) (height 64) (fps 5)
                                            (ssrc #x5e5e0001) (qi 12) (key-interval 120) (poll-secs 0.010)
                                            (max-qi 44) (target-kbs 150) (cleanup-ms 700)
-                                           (max-frame-kb 32) source log)
+                                           (max-frame-kb 32) source log on-stats)
   "Stream VP8 keyframes to the peer over SRTP.  CTX is the SRTP context (shared with audio — same
 DTLS keys, different SSRC).  SOURCE, when given, is a thunk returning (values Y U V w h) for the
 next frame or NIL if nothing changed since last time — so an idle screen costs no bandwidth.
@@ -189,6 +189,22 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                    ;; every ~5 s: min/mean/max per stage, so choppiness can be attributed
                    (let ((dt (/ (* 1000d0 (- (get-internal-real-time) last-report))
                                 internal-time-units-per-second)))
+                     (when (and on-stats (> dt 5000))
+                       ;; the same numbers as the log line, but as data — so a UI can present them
+                       ;; instead of a human grepping a log
+                       (funcall on-stats
+                                (list :at (- (get-universal-time) 2208988800)
+                                      :take-ms (list (ps-min st-take) (/ (ps-total st-take) (max 1 (ps-n st-take))) (ps-max st-take))
+                                      :encode-ms (list (ps-min st-enc) (/ (ps-total st-enc) (max 1 (ps-n st-enc))) (ps-max st-enc))
+                                      :refine-ms (list (ps-min st-clean) (/ (ps-total st-clean) (max 1 (ps-n st-clean))) (ps-max st-clean))
+                                      :send-ms (list (ps-min st-send) (/ (ps-total st-send) (max 1 (ps-n st-send))) (ps-max st-send))
+                                      :frame-kb (list (ps-min st-kb) (/ (ps-total st-kb) (max 1 (ps-n st-kb))) (ps-max st-kb))
+                                      :coded-mb (list (ps-min st-mbs) (/ (ps-total st-mbs) (max 1 (ps-n st-mbs))) (ps-max st-mbs))
+                                      :sent sent :idle skipped
+                                      :kbs (/ bytes 1.024 dt) :fps (/ (* 1000d0 sent) dt)
+                                      :qi cur-qi :bytes-per-mb bpm
+                                      :pending (if pending (count 1 pending) 0)
+                                      :cleanups cleanups)))
                      (when (and log (> dt 5000))
                        (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a | ~,1f KB/s | ~,1f fps | qi ~a b/mb ~,0f | pend ~a | cleans ~a"
                                             (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
