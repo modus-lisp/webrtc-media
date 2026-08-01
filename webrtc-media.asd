@@ -22,7 +22,7 @@ the same bundled ICE/DTLS transport."
      (:file "vp8")          ; VP8 keyframe encoder (RFC 6386 §9)
      (:file "vp8-encode")   ; real encoder
      (:file "vp8-parse")   ; bitstream parser (debug oracle)
-     (:file "vp8-inter")))))  ; inter (P) frames: ZEROMV + skip  ; bitstream parser (debug oracle)  ; real encoder: DC+AC, entropy contexts, prediction+reconstruction
+     (:file "vp8-inter")))))  ; inter (P) frames: ZEROMV / global motion vector + skip ; bitstream parser (debug oracle)  ; real encoder: DC+AC, entropy contexts, prediction+reconstruction
 
 (defsystem "webrtc-media/rtc"
   :description "Session glue: full-duplex G.711/SRTP audio over a webrtc-data ICE/DTLS transport."
