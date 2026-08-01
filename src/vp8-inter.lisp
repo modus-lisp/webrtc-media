@@ -83,6 +83,25 @@ makes the motion path hint-only (and therefore free on frames with no hint).")
   "Estimate only when at least this fraction of the macroblocks changed.  A scroll or a drag
 dirties a large part of the screen; a blinking cursor does not, and is not worth searching for.")
 
+;;; ---- the backlog quantizer -------------------------------------------------
+;;;
+;;; The per-frame byte budget bounds latency, but on its own it answers a screen the viewer
+;;; cannot keep up with by showing a SMALL PART of it sharply and deferring the rest — so a
+;;; scroll reads as a patchwork of new and old.  When demand runs far past the budget the useful
+;;; trade is the other way round: cover the whole screen coarsely and sharpen it once the motion
+;;; stops.  Coarse macroblocks land in the stale set, which is exactly what the idle refinement
+;;; pass exists to clean up, so nothing coarse survives the scroll.
+;;;
+;;; This is the only lever that makes a busy screen cheaper; the sender's rate control cannot,
+;;; because its own paced output is what it measures, so it never sees the overload at all.
+(defparameter *backlog-qi*
+  (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_BACKLOG_QI"))) 0)
+  "Quantizer to code a live frame at when it is far over budget; 0 disables (sharp and partial).")
+
+(defparameter *backlog-x*
+  (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_BACKLOG_X"))) 2)
+  "How far over budget counts as a backlog: demand above this multiple of MAX-MBS.")
+
 (defstruct (venc (:conc-name ve-))
   "Stateful encoder: holds the previous reconstruction, which is the reference for the next frame."
   ;; slot types matter: without them every plane access in the macroblock loop goes through
@@ -633,6 +652,18 @@ reconstruction into CUR.  Returns T if anything was coded."
                                      (aref rec i)))))))))
     any))
 
+(defun %region-stale-p (was-stale mc mr ox oy mvx mvy)
+  "T if any macroblock the translated block at (OX+MVX, OY+MVY) reads from has NOT converged in
+the decoder — coded coarsely, or deferred and so never sent at all.  A vector may only carry
+pixels the viewer actually has; carrying stale ones is how one un-sent macroblock spreads."
+  (declare (type simple-bit-vector was-stale) (type fixnum mc mr ox oy mvx mvy)
+           (optimize (speed 3) (safety 0)))
+  (loop for (dx dy) in '((0 0) (15 0) (0 15) (15 15))
+          thereis (let ((bx (floor (+ ox mvx (the fixnum dx)) 16))
+                        (by (floor (+ oy mvy (the fixnum dy)) 16)))
+                    (and (>= bx 0) (< bx mc) (>= by 0) (< by mr)
+                         (= 1 (aref was-stale (+ (* by mc) bx)))))))
+
 (defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12) max-mbs motion)
   "Encode one inter frame of Y/U/V against the encoder's reference, updating the reference in
 place.  Unchanged macroblocks are skipped outright.  DIRTY, when given, is a per-macroblock bit
@@ -665,9 +696,19 @@ Returns (values bytes coded-mb-count deferred motion-vector)."
          (ru (the (simple-array (unsigned-byte 8) (*)) (ve-ref-u enc)))
          (rv (the (simple-array (unsigned-byte 8) (*)) (ve-ref-v enc)))
          (bw (make-bwriter)) (tw (make-bwriter)) (probs +default-coef-probs+)
-         (dcq (dc-quant qi)) (acq (ac-quant qi))
-         (y2dcq (y2-dc-quant qi)) (y2acq (y2-ac-quant qi))
-         (uvdcq (min 132 (dc-quant qi))) (uvacq (ac-quant qi))
+         ;; the quantizer this frame actually codes at: QI, unless a LIVE frame (one carrying a
+         ;; new source, not a drain or a refinement — those must stay sharp, and a refinement that
+         ;; coarsened would re-stale exactly what it just cleaned and never converge) wants far
+         ;; more macroblocks than its budget allows, in which case coverage beats sharpness.
+         (eqi (if (and (plusp *backlog-qi*) max-mbs
+                       (not (eq y (ve-prev-y enc)))
+                       (> (if dirty (count 1 (the simple-bit-vector dirty)) (* mc mr))
+                          (* *backlog-x* (the fixnum max-mbs))))
+                  (max qi (the fixnum *backlog-qi*))
+                  qi))
+         (dcq (dc-quant eqi)) (acq (ac-quant eqi))
+         (y2dcq (y2-dc-quant eqi)) (y2acq (y2-ac-quant eqi))
+         (uvdcq (min 132 (dc-quant eqi))) (uvacq (ac-quant eqi))
          (ctxs (make-contexts mc)) (coded 0) (deferred nil)
          (blk (mkblk)) (co (mkblk)) (y2in (mkblk)) (y2co (mkblk)) (y2q (mkblk))
          (dq (mkblk)) (rec (mkblk)) (y2dq (mkblk)) (y2r (mkblk))
@@ -724,7 +765,7 @@ Returns (values bytes coded-mb-count deferred motion-vector)."
     (bwrite-literal bw 0 3)                      ; sharpness_level
     (bwrite-literal bw 0 1)                      ; loop_filter_adj_enable
     (bwrite-literal bw 0 2)                      ; one token partition
-    (bwrite-literal bw qi 7)                     ; y_ac_qi
+    (bwrite-literal bw eqi 7)                    ; y_ac_qi
     (dotimes (i 5) (bwrite-literal bw 0 1))      ; no quantizer deltas
     ;; inter-only reference-buffer flags: refresh everything from this frame, no sign bias
     (bwrite-literal bw 1 1)                      ; refresh_golden_frame
@@ -767,7 +808,15 @@ Returns (values bytes coded-mb-count deferred motion-vector)."
                ;; ... and does it simply carry translated pixels, needing no coefficients?  This
                ;; overrides FORCE: a macroblock that only moved has nothing to refine in place,
                ;; and re-coding it is exactly the full-screen cost the vector exists to avoid.
+               ;;
+               ;; But only if the pixels it carries are ones the viewer HAS.  The test is on the
+               ;; source — "these pixels merely translated" — while the copy is made from the
+               ;; REFERENCE, and under a byte budget those can disagree: a macroblock deferred
+               ;; last frame was never sent, so translating from it hands the viewer content it
+               ;; never received, marks nothing dirty, and drops the debt.  A whole scroll then
+               ;; smears un-sent content across the screen and only a keyframe repairs it.
                (moved (and mvable
+                           (not (%region-stale-p was-stale mc mr ox oy gmvx gmvy))
                            (%mb-moved-p y (ve-prev-y enc) w h ox oy gmvx gmvy 16)
                            (%mb-moved-chroma-p u (ve-prev-u enc) sw sh cx cy2 gmvx gmvy ftmp cbuf)
                            (%mb-moved-chroma-p v (ve-prev-v enc) sw sh cx cy2 gmvx gmvy ftmp cbuf)))
@@ -779,7 +828,11 @@ Returns (values bytes coded-mb-count deferred motion-vector)."
           (declare (type fixnum mvx mvy))
           (when over
             (unless deferred (setf deferred (make-array (* mc mr) :element-type 'bit :initial-element 0)))
-            (setf (aref (the simple-bit-vector deferred) mbi) 1))
+            (setf (aref (the simple-bit-vector deferred) mbi) 1)
+            ;; the viewer has NOT been shown this macroblock — the strongest form of stale.  Say so:
+            ;; the idle refinement then comes back for it even if the carry-forward is lost, and
+            ;; nothing translates from it while it is still owed.
+            (let ((st (ve-stale-mbs enc))) (when st (setf (aref st mbi) 1))))
           ;; choose the prediction: the global vector only if it beats the co-located one
           (cond
             (moved (setf mvx gmvx mvy gmvy))
@@ -841,17 +894,11 @@ Returns (values bytes coded-mb-count deferred motion-vector)."
                  (let ((st (ve-stale-mbs enc)))
                    (when st
                      (setf (aref st mbi)
-                           (let ((s 0))
-                             (loop for (dx dy) in '((0 0) (15 0) (0 15) (15 15)) do
-                               (let ((bx (floor (+ ox mvx dx) 16)) (by (floor (+ oy mvy dy) 16)))
-                                 (when (and (>= bx 0) (< bx mc) (>= by 0) (< by mr))
-                                   (setf s (logior s (aref (the simple-bit-vector was-stale)
-                                                           (+ (* by mc) bx)))))))
-                             s))))))
+                           (if (%region-stale-p was-stale mc mr ox oy mvx mvy) 1 0))))))
               (t
                (incf coded)
                (let ((st (ve-stale-mbs enc)))
-                 (when st (setf (aref st mbi) (if (> qi clean-qi) 1 0))))
+                 (when st (setf (aref st mbi) (if (> eqi clean-qi) 1 0))))
                ;; build the prediction for this macroblock, then code the residual against it
                (%copy-pred ry pw (+ ox mvx) (+ oy mvy) py 16)
                (if moving
