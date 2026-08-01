@@ -104,7 +104,15 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
              (idle-since (get-internal-real-time)) (cleanups 0)
              ;; macroblocks that wanted coding but did not fit in a frame's byte budget, carried
              ;; forward so a big change refreshes progressively instead of in one huge frame
-             (pending nil) (bpm 110d0))
+             (pending nil) (bpm 110d0)
+             ;; RESYNC ON A WALL CLOCK, not on source activity.  key-interval counts loop passes and
+             ;; is only consulted when the capture actually returned a frame, so on an idle desktop
+             ;; the FIRST keyframe was the only one ever sent — and inter frames are undecodable
+             ;; without it.  A receiver that was not ready for that one (or lost it) then waits
+             ;; forever, which is exactly "connected, 9 KB/s of audio, no first frame".  We have no
+             ;; RTCP PLI parsing yet, so re-send periodically: often early in a session, when a
+             ;; not-yet-ready receiver is likely, then rarely as a safety net.
+             (session-start (get-internal-real-time)) (last-key 0))
          (loop while running do
            (handler-case
                (multiple-value-bind (y u v w h dirty)
@@ -112,6 +120,29 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                  (let* ((need-key (or (null enc) (zerop (mod n key-interval))))
                         (frame
                           (cond
+                            ;; a keyframe is owed and the desktop is idle: re-encode one from the
+                            ;; last source we saw, so a late receiver can start decoding
+                            ((and (null y) source enc (vp8::ve-have-ref enc)
+                                  (let* ((now (get-internal-real-time))
+                                         (age (/ (float (- now last-key)) internal-time-units-per-second))
+                                         (session-age (/ (float (- now session-start))
+                                                         internal-time-units-per-second)))
+                                    (> age (if (< session-age 30) 3.0 30.0))))
+                             (setf last-key (get-internal-real-time) pending nil)
+                             (let ((py (vp8::ve-prev-y enc)) (pu (vp8::ve-prev-u enc))
+                                   (pv (vp8::ve-prev-v enc))
+                                   (w (vp8::ve-width enc)) (h (vp8::ve-height enc)))
+                               (setf enc (vp8::make-encoder w h))
+                               (multiple-value-bind (f ry ru rv)
+                                   (with-timing (st-enc) (vp8:encode-gray-frame py w h :qi qi :u pu :v pv))
+                                 (setf (vp8::ve-ref-y enc) ry (vp8::ve-ref-u enc) ru
+                                       (vp8::ve-ref-v enc) rv)
+                                 (replace (vp8::ve-prev-y enc) py) (replace (vp8::ve-prev-u enc) pu)
+                                 (replace (vp8::ve-prev-v enc) pv)
+                                 (setf (vp8::ve-have-ref enc) t (vp8::ve-stale-mbs enc)
+                                       (make-array (* (vp8::ve-mb-cols enc) (vp8::ve-mb-rows enc))
+                                                   :element-type 'bit :initial-element 0))
+                                 f)))
                             ((null y)
                              (if (null source)                 ; built-in test pattern
                                  (if (evenp (floor n 3))
@@ -183,8 +214,18 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                        (with-timing (st-send)
                          (multiple-value-bind (pkts next) (vp8-packetize frame seq ts ssrc pt)
                            (setf seq next)
-                           (dolist (p pkts)
-                             (webrtc-data:ice-send-to-peer agent (srtp-protect ctx p)))
+                           ;; PACE THE BURST.  A keyframe is ~75 packets; handing them all to the
+                           ;; socket at once is a microburst that overruns a queue somewhere on the
+                           ;; relay path, and a VP8 keyframe missing ONE fragment is undecodable —
+                           ;; which looks exactly like "connected, receiving, no first frame".  Inter
+                           ;; frames are small enough to send as-is; anything big gets spread at
+                           ;; roughly the rate we are steering toward, so it arrives slightly later
+                           ;; but arrives whole.
+                           (let ((gap (and (> (length pkts) 8)
+                                           (/ (/ 1100d0 (* 1024 target-kbs)) 1))))
+                             (dolist (p pkts)
+                               (webrtc-data:ice-send-to-peer agent (srtp-protect ctx p))
+                               (when gap (sleep gap))))
                            (incf sent) (incf bytes (length frame)) (incf rc-bytes (length frame))
                            (ps-note st-kb (/ (length frame) 1024d0))
                            (ps-note st-qi cur-qi)))
