@@ -40,6 +40,19 @@ returns (values y u v w h dirty), and collapsing that to one value silently nils
 (defun ps-reset (st) (setf (ps-n st) 0 (ps-min st) 1d9 (ps-max st) 0d0 (ps-total st) 0d0))
 (defparameter *vp8-max-payload* 1100)     ; keep the whole SRTP packet under a safe path MTU
 
+;;; ---- switching quality under a running sender ------------------------------
+;;; Every knob START-VIDEO takes is consulted on each pass of the encode loop, not baked into the
+;;; frame pipeline at startup — so a profile can be swapped while the stream runs.  That is the
+;;; whole point: restarting the sender would restart its RTP sequence and timestamp, which a
+;;; receiver reads as a different stream, and the picture stops for as long as it takes to
+;;; resynchronise.  Comparing two profiles by feel is impossible if switching costs you the frame.
+;;;
+;;; Bind or SETF this to a plist of any of (:qi :max-qi :target-kbs :max-frame-kb :cleanup-ms);
+;;; whatever it names overrides the corresponding argument from the next pass onward, and NIL
+;;; leaves the sender on the values it was started with.
+(defvar *video-profile* nil)
+(defvar *video-profile-applied* nil)      ; last plist logged, so a switch is reported once
+
 (defun vp8-packetize (frame seq ts ssrc pt &key (max-payload *vp8-max-payload*))
   "Split a VP8 FRAME into a list of packed RTP packets (RFC 7741 minimal descriptor).
 SEQ is the starting sequence number; returns (values packets next-seq)."
@@ -222,6 +235,22 @@ re-coded at QI, so a burst of motion leaves no lasting mush behind.  Returns a S
                                             internal-time-units-per-second)))
                      (setf last-tick now))))
              (error (e) (when log (funcall log (format nil "video tx: ~a" e)))))
+           ;; adopt a profile switched under us — see *VIDEO-PROFILE*.  Every knob below is read
+           ;; again on the next pass, so this is the entire cost of switching quality live: no
+           ;; restart, no new keyframe, no gap in the sequence the receiver is following.
+           (let ((p *video-profile*))
+             (when (consp p)
+               (setf qi           (or (getf p :qi) qi)
+                     max-qi       (or (getf p :max-qi) max-qi)
+                     target-kbs   (or (getf p :target-kbs) target-kbs)
+                     max-frame-kb (or (getf p :max-frame-kb) max-frame-kb)
+                     cleanup-ms   (or (getf p :cleanup-ms) cleanup-ms)
+                     cur-qi       (min (max cur-qi qi) max-qi))
+               (unless (equal p *video-profile-applied*)
+                 (setf *video-profile-applied* p)
+                 (when log
+                   (funcall log (format nil "profile ~@[~a ~]applied live: qi ~a/~a target ~a KB/s frame<=~a KB cleanup ~a ms"
+                                        (getf p :name) qi max-qi target-kbs max-frame-kb cleanup-ms))))))
            ;; poll on a short tick rather than 1/fps: capture-take returns NIL when nothing
            ;; changed (cheap), so this only affects how quickly a change is noticed, and the
            ;; encode itself is what paces us on a busy screen.

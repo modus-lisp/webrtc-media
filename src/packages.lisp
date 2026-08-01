@@ -27,4 +27,6 @@
    #:srtp-protect #:srtp-unprotect
    #:+srtp-aead-aes-128-gcm+
    ;; session glue (webrtc-media/rtc)
-   #:start-audio #:start-video #:vp8-packetize))
+   #:start-audio #:start-video #:vp8-packetize
+   ;; live quality switching: set this and a RUNNING sender adopts it (see vp8-rtp.lisp)
+   #:*video-profile*))
