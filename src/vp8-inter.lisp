@@ -562,38 +562,110 @@ one displacement the whole screen shares collects a vote from all of them."
                   (incf (gethash d votes 0)))))))))
     (mapcar (lambda (d) (if (eq axis :x) (cons d 0) (cons 0 d))) (%rank-votes votes 4))))
 
-(defun %scan-grid (y prev w h probes limit step)
-  "Per probe, ITS best 2-D displacement: a coarse grid to find the neighbourhood, then every pixel
-inside that neighbourhood.  The fallback for a drag, which moves on both axes at once so nothing
-separable finds it — and on detailed content a coarse grid alone lands BESIDE the answer, which is
-no use when the point is an exact translation.  Distinct winners, most-named first.
+(defun %scan-grid (y prev w h probes limit &key (step 4) (near 32) (near-step 2))
+  "Per probe, ITS best 2-D displacement: a grid to find the neighbourhood, then every pixel inside
+it.  The fallback for a drag, which moves on both axes at once so nothing separable finds it — and
+on detailed content a coarse grid alone lands BESIDE the answer, which is no use when the point is
+an exact translation.  Distinct winners, most-named first.
+
+TWO SCALES, because a drag has two.  The coarse comparison DECIMATES rather than blurs, so on text
+a grid point two pixels off the answer scores no better than one nowhere near it: the grid can
+only find what it lands on exactly, or near enough for the refinement to walk in.  A step of four
+is close enough over most of the range, but it misses displacements that are small AND odd — a
+window nudged twenty across and ten down — which is the commonest interactive case of all.  So the
+first +-NEAR pixels are swept every NEAR-STEP, and the rest every STEP.  Each scale nominates its
+own candidates, so a crowd of near ones cannot shut the far ones out.
+
+THE GRID IS ANCHORED ON ZERO, which is not a detail.  Stepping from -LIMIT upward puts the grid on
+the residue class of LIMIT, so a limit that is not a multiple of the step yields a grid containing
+no multiple of the step at all — no zero, and none of the displacements a screen actually moves
+by.  The search then reports whatever noise scores best, having never evaluated the answer.  This
+was survivable only because the range used to be +-96, which is a multiple of 4 by luck.
+
+RANGE IS THE FORMAT'S, not a cost guard.  Between two frames of a drag the picture moves by
+whatever the sender could not afford to encode in between: a few pixels when the link is free and
+two hundred when it is not, the same gesture sampled at a different rate.  Capped at +-96, a drag
+that moved further than that between two frames had no vector at all — it was priced, and coded,
+as if the whole screen were new content, which is the expensive way to say a window slid sideways.
+
+Candidates are the best few DISTINCT neighbourhoods rather than the best few points: a good match
+arrives as a cluster, and a cluster around one decoy would otherwise take every slot.
 
 Generation may be noisy; %VOTE is what decides.  A probe in the newly exposed strip names
-something arbitrary, and nobody agrees with it."
-  (let ((votes (make-hash-table :test #'equal)))
+something arbitrary, and nobody agrees with it.
+
+The sweep keeps its shortlist in preallocated arrays rather than a list of candidates: at a step of
+four over the format's range it visits ~16000 displacements per probe, and consing one cell per
+displacement costs several times what the comparisons do."
+  (declare (type (simple-array (unsigned-byte 8) (*)) y prev)
+           (type fixnum w h limit step near near-step)
+           (optimize (speed 3) (safety 1)))
+  (let* ((votes (make-hash-table :test #'equal))
+         (near (min near limit))
+         (k 64)                                  ; shortlist size: room for six neighbourhoods
+         (cs (make-array k :element-type 'fixnum))
+         (cx (make-array k :element-type 'fixnum))
+         (cy (make-array k :element-type 'fixnum))
+         (ord (make-array k :element-type 'fixnum)))
+    (declare (type fixnum near k)
+             (type (simple-array fixnum (*)) cs cx cy ord))
     (dolist (p probes)
-      (let ((ox (* 16 (first p))) (oy (* 16 (second p))) (coarse '()))
+      (let ((ox (* 16 (the fixnum (first p)))) (oy (* 16 (the fixnum (second p)))))
+        (declare (type fixnum ox oy))
         (flet ((sad-at (dx dy sample)
+                 (declare (type fixnum dx dy sample))
                  (let ((rx (+ ox dx)) (ry (+ oy dy)))
+                   (declare (type fixnum rx ry))
                    (if (and (>= rx 0) (>= ry 0) (<= (+ rx 16) w) (<= (+ ry 16) h))
                        (%sad16-fast y w ox oy prev w rx ry sample)
                        most-positive-fixnum))))
-          ;; the three most promising coarse neighbourhoods, not just the best: on detailed
-          ;; content the grid point next to the answer is not always the grid's own winner
-          (loop for dy from (- limit) to limit by step do
-            (loop for dx from (- limit) to limit by step do
-              (let ((s (sad-at dx dy 4)))
-                (when (< s most-positive-fixnum)
-                  (push (list s dx dy) coarse)))))
-          (dolist (c (subseq (sort coarse #'< :key #'first) 0 (min 3 (length coarse))))
-            (let ((s most-positive-fixnum) (bx 0) (by 0))
-              (loop for dy from (- (third c) step) to (+ (third c) step) do
-                (loop for dx from (- (second c) step) to (+ (second c) step) do
-                  (let ((v (sad-at dx dy 2)))
-                    (when (< v s) (setf s v bx dx by dy)))))
-              (unless (and (zerop bx) (zerop by))
-                (incf (gethash (cons bx by) votes 0))))))))
-    (%rank-votes votes 6)))
+          (flet ((scale (bound st)
+                   "Sweep multiples of ST out to BOUND — so the grid always contains zero, whatever
+BOUND is — keep the best K, and refine the best few DISTINCT ones to the pixel."
+                   (declare (type fixnum bound st))
+                   (let ((n (floor bound st)) (worst 0) (filled 0))
+                     (declare (type fixnum n worst filled))
+                     (fill cs most-positive-fixnum)
+                     (loop for iy of-type fixnum from (- n) to n do
+                       (loop for ix of-type fixnum from (- n) to n do
+                         (let* ((dx (* ix st)) (dy (* iy st)) (s (sad-at dx dy 4)))
+                           (declare (type fixnum dx dy s))
+                           (when (< s (aref cs worst))
+                             (setf (aref cs worst) s (aref cx worst) dx (aref cy worst) dy)
+                             (setf filled (min k (1+ filled)))
+                             ;; whichever slot is now the weakest is the next to be displaced
+                             (let ((bad 0))
+                               (declare (type fixnum bad))
+                               (dotimes (i k) (when (> (aref cs i) (aref cs bad)) (setf bad i)))
+                               (setf worst bad))))))
+                     (dotimes (i k) (setf (aref ord i) i))
+                     (sort ord #'< :key (lambda (i) (aref cs i)))
+                     (let ((taken 0) (tx (make-array 6 :element-type 'fixnum))
+                           (ty (make-array 6 :element-type 'fixnum)))
+                       (declare (type fixnum taken) (type (simple-array fixnum (6)) tx ty)
+                                (dynamic-extent tx ty))
+                       (dotimes (j (min k filled))
+                         (let* ((i (aref ord j)) (dx (aref cx i)) (dy (aref cy i)))
+                           (declare (type fixnum dx dy))
+                           (when (and (< taken 6)
+                                      (< (aref cs i) most-positive-fixnum)
+                                      (dotimes (q taken t)
+                                        (when (and (<= (abs (- (aref tx q) dx)) st)
+                                                   (<= (abs (- (aref ty q) dy)) st))
+                                          (return nil))))
+                             (setf (aref tx taken) dx (aref ty taken) dy)
+                             (incf taken)
+                             (let ((s most-positive-fixnum) (bx 0) (by 0))
+                               (declare (type fixnum s bx by))
+                               (loop for ry of-type fixnum from (- dy st) to (+ dy st) do
+                                 (loop for rx of-type fixnum from (- dx st) to (+ dx st) do
+                                   (let ((val (sad-at rx ry 2)))
+                                     (when (< val s) (setf s val bx rx by ry)))))
+                               (unless (and (zerop bx) (zerop by))
+                                 (incf (the fixnum (gethash (cons bx by) votes 0))))))))))))
+            (scale near near-step)
+            (scale limit step)))))
+    (%rank-votes votes 8)))
 
 (defun %estimate-global-mv (enc y dirty)
   "Estimate the frame's global motion vector, in whole pixels, or NIL.  The vector is the
@@ -615,7 +687,83 @@ REFERENCE offset: the prediction for a block comes from the previous frame at +(
     (let ((few (subseq probes 0 (min 8 (length probes)))))
       (or (%vote y prev w h probes (%scan-axis y prev w h few :y limit))
           (%vote y prev w h probes (%scan-axis y prev w h few :x limit))
-          (%vote y prev w h probes (%scan-grid y prev w h few (min limit 96) 4))))))
+          (%vote y prev w h probes (%scan-grid y prev w h few limit))))))
+
+;;; ---- what a frame will cost, before it is coded ----------------------------
+;;;
+;;; A sender that has to choose between an inter frame and a keyframe needs a price for each, and
+;;; the price of an inter frame is not one number times a macroblock count.  There are TWO
+;;; populations in a changed region and they cost different things:
+;;;
+;;;   translating  — the pixels are the previous frame's, displaced by the frame's vector.  The
+;;;                  macroblock codes a mode and a vector reference and NO coefficients: about a
+;;;                  byte, and the same byte at every quantizer.
+;;;   new          — genuinely different content.  Coefficients, priced by the learned
+;;;                  bytes-per-macroblock figure and moving with the quantizer.
+;;;
+;;; A drag or a scroll is almost entirely the first kind while looking, to anything that only
+;;; counts dirty macroblocks, exactly like the second.  That is why the caller is given the count
+;;; and not just the vector: "most of the screen changed" and "most of the screen moved" have to
+;;; be different numbers or a translation gets priced as a re-encode.
+
+(defun predict-motion (enc y u v &key dirty (sample 12))
+  "This frame's global motion vector and how much of the change it already accounts for.
+
+Returns (values MOTION TRANSLATING DIRTY-COUNT).  MOTION is (dx . dy), how far the picture MOVED
+— the same form ENCODE-INTER-FRAME takes as its :MOTION argument, so a caller may hand the answer
+straight back and the search is paid for once — or NIL when there is no usable vector, in which
+case TRANSLATING is 0 and every changed macroblock is new content.
+
+TRANSLATING is the encoder's own test, not an approximation of it: a macroblock counts only if the
+vector's prediction lies wholly inside the reference, the pixels it would carry are ones the viewer
+HAS (nothing stale travels), and luma and chroma both reproduce exactly.  What is approximate is
+the CENSUS — every SAMPLE-th changed macroblock is tested and the count scaled — because the
+answer only has to be good enough to choose between two frame types, and testing all of them would
+cost as much as the encode it is meant to inform.
+
+The gates are deliberately the same ones ENCODE-INTER-FRAME applies to its own search, so a NIL
+answer here means the encoder would have found nothing either."
+  (declare (type (simple-array (unsigned-byte 8) (*)) y u v)
+           (optimize (speed 3) (safety 1)))
+  (let* ((mc (ve-mb-cols enc)) (mr (ve-mb-rows enc))
+         (n (if dirty (count 1 (the simple-bit-vector dirty)) (* mc mr))))
+    (declare (type fixnum mc mr n))
+    (when (or (not *motion-vectors*) (not *motion-search*) (not (ve-have-ref enc)) (zerop n)
+              (and dirty (< n (* *motion-search-min-dirty* mc mr))))
+      (return-from predict-motion (values nil 0 n)))
+    (%motion-state enc)
+    (let ((gmv (%estimate-global-mv enc y dirty)))
+      (unless (and gmv (or (/= 0 (car gmv)) (/= 0 (cdr gmv)))
+                   (<= (abs (the fixnum (car gmv))) +mv-max-pel+)
+                   (<= (abs (the fixnum (cdr gmv))) +mv-max-pel+))
+        (return-from predict-motion (values nil 0 n)))
+      (let* ((gmvx (car gmv)) (gmvy (cdr gmv))
+             (w (ve-width enc)) (h (ve-height enc))
+             (sw (ceiling w 2)) (sh (ceiling h 2))
+             (pw (ve-pw enc)) (ph (ve-ph enc)) (cw (ve-cw enc)) (chh (ve-chh enc))
+             (py (ve-prev-y enc)) (pu (ve-prev-u enc)) (pv (ve-prev-v enc))
+             (stale (ve-stale-mbs enc))
+             (ftmp (make-array 104 :element-type '(signed-byte 32)))
+             (cbuf (make-array 64 :element-type '(unsigned-byte 8)))
+             (step (max 1 sample)) (seen 0) (tried 0) (hit 0))
+        (declare (type fixnum gmvx gmvy seen tried hit step))
+        (dotimes (mby mr)
+          (dotimes (mbx mc)
+            (let ((mbi (+ (* mby mc) mbx)))
+              (when (or (null dirty) (= 1 (aref (the simple-bit-vector dirty) mbi)))
+                (when (zerop (mod seen step))
+                  (incf tried)
+                  (let ((ox (* 16 mbx)) (oy (* 16 mby)) (cx (* 8 mbx)) (cy (* 8 mby)))
+                    (when (and (%mv-fits-p mbx mby gmvx gmvy pw ph cw chh)
+                               (not (and stale (%region-stale-p stale mc mr ox oy gmvx gmvy)))
+                               (%mb-moved-p y py w h ox oy gmvx gmvy 16)
+                               (%mb-moved-chroma-p u pu sw sh cx cy gmvx gmvy ftmp cbuf)
+                               (%mb-moved-chroma-p v pv sw sh cx cy gmvx gmvy ftmp cbuf))
+                      (incf hit))))
+                (incf seen)))))
+        (values (cons (- gmvx) (- gmvy))
+                (if (plusp tried) (min n (round (* n hit) tried)) 0)
+                n)))))
 
 ;;; ---- residual coding -------------------------------------------------------
 
@@ -685,10 +833,12 @@ coding are left skipped and reported in the returned DEFERRED bit vector so the 
 them into the next frame.  That bounds FRAME SIZE, which is what actually bounds latency: one
 143 KB frame is ~570 ms in flight on a 250 KB/s link, and no average-rate control can see that.
 A big change then arrives as a couple of progressive frames instead of one long stall.
-Returns (values bytes coded-mb-count deferred motion-vector quantizer).  QUANTIZER is the one the
-frame was ACTUALLY coded at, which is not always QI — see the backlog rule above.  A caller that
-models what a quantizer costs has to be told which one it got, or its next estimate is wrong by
-whatever the encoder decided on its own."
+Returns (values bytes coded-mb-count deferred motion-vector quantizer translated).  QUANTIZER is
+the one the frame was ACTUALLY coded at, which is not always QI — see the backlog rule above.  A
+caller that models what a quantizer costs has to be told which one it got, or its next estimate is
+wrong by whatever the encoder decided on its own.  TRANSLATED is how many macroblocks the vector
+carried outright, coefficient-free: the same census PREDICT-MOTION estimates, but exact, so a
+caller learning what a translation costs learns it from the count that actually happened."
   (declare (type (simple-array (unsigned-byte 8) (*)) y u v)
            (optimize (speed 3) (safety 1)))
   (let* ((mc (ve-mb-cols enc)) (mr (ve-mb-rows enc))
@@ -712,7 +862,7 @@ whatever the encoder decided on its own."
          (dcq (dc-quant eqi)) (acq (ac-quant eqi))
          (y2dcq (y2-dc-quant eqi)) (y2acq (y2-ac-quant eqi))
          (uvdcq (min 132 (dc-quant eqi))) (uvacq (ac-quant eqi))
-         (ctxs (make-contexts mc)) (coded 0) (deferred nil)
+         (ctxs (make-contexts mc)) (coded 0) (translated 0) (deferred nil)
          (blk (mkblk)) (co (mkblk)) (y2in (mkblk)) (y2co (mkblk)) (y2q (mkblk))
          (dq (mkblk)) (rec (mkblk)) (y2dq (mkblk)) (y2r (mkblk))
          ;; scratch reused for every macroblock: this loop used to cons ~30 short arrays per
@@ -747,7 +897,7 @@ whatever the encoder decided on its own."
          (cv (if use-mv (ms-cur-v ms) rv))
          (mvr (when use-mv (ms-mv-row ms))) (mvc (when use-mv (ms-mv-col ms)))
          (was-stale (when use-mv (ms-was-stale ms))))
-    (declare (type fixnum gmvx gmvy coded)
+    (declare (type fixnum gmvx gmvy coded translated)
              (type (simple-array (unsigned-byte 8) (*)) cy cu cv)
              (type (simple-array (unsigned-byte 8) (256)) py)
              (type (simple-array (unsigned-byte 8) (64)) pu pv cbuf))
@@ -829,6 +979,7 @@ whatever the encoder decided on its own."
                (skip (or skip0 over))
                (mvx 0) (mvy 0))
           (declare (type fixnum mvx mvy))
+          (when moved (incf translated))
           (when over
             (unless deferred (setf deferred (make-array (* mc mr) :element-type 'bit :initial-element 0)))
             (setf (aref (the simple-bit-vector deferred) mbi) 1)
@@ -973,4 +1124,4 @@ whatever the encoder decided on its own."
       (vector-push-extend (logand (ash tag -16) #xff) frame)
       (loop for b across p1 do (vector-push-extend b frame))
       (loop for b across p2 do (vector-push-extend b frame))
-      (values frame coded deferred (when use-mv (cons (- gmvx) (- gmvy))) eqi))))
+      (values frame coded deferred (when use-mv (cons (- gmvx) (- gmvy))) eqi translated))))

@@ -62,13 +62,33 @@ returns (values y u v w h dirty), and collapsing that to one value silently nils
 ;;; format has cannot cover the change inside the ceiling below.  Choosing between quantizers
 ;;; needs a cost model, and the model is one number times a fixed curve:
 ;;;
-;;;     frame bytes  ~=  overhead  +  coded-macroblocks * BPU * (QI-COST qi)
+;;;     frame bytes  ~=  overhead  +  translating * MPU  +  new * BPU * (QI-COST qi)
 ;;;
 ;;; BPU is learned from the encoder's own output (how expensive THIS screen's content is, in
 ;;; bytes per macroblock, normalised to qi 63) and QI-COST is the shape of the rate/quantizer
 ;;; curve, which barely depends on content.  OVERHEAD is the per-macroblock skip flag every inter
 ;;; frame pays whether it codes anything or not — ~500 bytes at 1280x800, which at the bottom of
 ;;; the ladder is most of a frame's budget and cannot be left out of the arithmetic.
+;;;
+;;; THE CHANGED REGION HAS TWO POPULATIONS AND THEY DO NOT COST THE SAME, which is the whole
+;;; reason there are two terms.  BPU prices COEFFICIENTS; a macroblock that merely translated
+;;; codes none.  It spends a mode and a vector reference — MPU, about a byte, and the same byte at
+;;; every quantizer, because a quantizer is a price per coefficient and there are none.
+;;;
+;;; Splitting them is not a refinement, it is the difference between a drag costing a keyframe and
+;;; a drag costing nothing.  Dragging or scrolling a window dirties most of the screen and
+;;; translates almost all of what it dirties.  Priced on the dirty count alone — which is what
+;;; this model used to do, because BPU was applied to every macroblock the frame was asked to
+;;; cover — a drag reads as four thousand macroblocks of fresh content, the estimate comes out
+;;; above a keyframe's, and rule (3) fires: ~22 KB, 4.5 s of a 40 kbps link, to say "the window is
+;;; 300 pixels to the right".  Worse, the SAME arithmetic chooses the quantizer, so the frames
+;;; that were emitted came out needlessly coarse as well.
+;;;
+;;; The counts come from VP8::PREDICT-MOTION, which runs the encoder's own translation test over a
+;;; sample of the changed macroblocks before the frame is coded, and the vector it finds is then
+;;; handed to the encoder so the search is paid for once.  So this is still two MEASUREMENTS
+;;; compared, not two guesses — and rule (3) still fires for a window switch or a page load, where
+;;; there is no vector to find and every macroblock genuinely is new content.
 
 (defparameter *qi-cost*
   '((8 . 2.90d0) (16 . 2.29d0) (24 . 1.92d0) (32 . 1.66d0) (44 . 1.38d0) (56 . 1.16d0)
@@ -219,6 +239,10 @@ have reassembled, when it would have had it.  Returns a STOP thunk."
          ;; the 5-second average says.
          (st-clean (make-pstat :name "refine")) (st-kb (make-pstat :name "frameKB"))
          (st-mbs (make-pstat :name "codedMB")) (st-qi (make-pstat :name "qi"))
+         ;; macroblocks the frame's motion vector carried outright.  Worth its own counter: it is
+         ;; the difference between "the screen changed" and "the screen moved", and without it a
+         ;; drag and a window switch look identical in every number the sender reports.
+         (st-mv (make-pstat :name "movedMB"))
          (st-lag (make-pstat :name "lag"))
          (sent 0) (bytes 0) (skipped 0) (takes 0))
     (labels ((link-busy-p ()
@@ -290,7 +314,10 @@ sleep, which is what keeps the capture clock independent of the link rate."
                ;;        of which a refinement pays only the part not already sent.
                ;;   KPU  intra.  Measured: 22116 bytes for 4000 macroblocks at qi 127, i.e.
                ;;        17.5 at qi 63 — the keyframe cost table this whole ladder is built on.
-               (bpu 35d0) (rpu 17.5d0) (kpu 17.5d0)
+               ;;   MPU  a translating macroblock: a mode and a vector reference, no coefficients.
+               ;;        NOT normalised to a quantizer, because it does not have one — this is the
+               ;;        one term in the model that a coarser frame does not make cheaper.
+               (bpu 35d0) (rpu 17.5d0) (kpu 17.5d0) (mpu 1.0d0)
                (cur-qi qi) (qi-bias 0) (stale-qi qi)
                ;; RESYNC ON A WALL CLOCK, not on source activity, and at a RATE-SCALED interval.
                ;; A keyframe is ~22 KB whatever we do to it, so at 40 kbps a 3 s resync is 16 s of
@@ -375,18 +402,40 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                         ((null dirty) pending)
                                         (t (bit-ior pending dirty))))
                             (nwant (if want (count 1 want) mbs))
-                            (fq (fit-quantizer nwant ceiling-bytes bpu overhead qi max-qi))
-                            (fits (<= (* nwant bpu (qi-cost fq)) (- ceiling-bytes overhead)))
+                            ;; HOW MUCH OF THE CHANGE IS MERELY A TRANSLATION.  Asked before the
+                            ;; frame is coded, because it is what decides HOW to code it — and
+                            ;; asked of the encoder's own translation test rather than guessed, so
+                            ;; the two terms below are both measurements.  The vector goes back
+                            ;; into the encode below, so the search happens once per frame.
+                            (mvp (when (and enc y)
+                                   (multiple-value-list
+                                    (vp8::predict-motion enc y u v :dirty want))))
+                            (gmv (first mvp))
+                            (nmv (if gmv (min nwant (or (second mvp) 0)) 0))
+                            (nnew (max 0 (- nwant nmv)))
+                            ;; the translating part costs the same at every quantizer, so it is
+                            ;; not something FIT-QUANTIZER can trade against sharpness: it comes
+                            ;; off the top, exactly like the skip flags do.
+                            (mv-bytes (* nmv mpu))
+                            (live-overhead (+ overhead mv-bytes))
+                            (fq (fit-quantizer nnew ceiling-bytes bpu live-overhead qi max-qi))
+                            (fits (<= (* nnew bpu (qi-cost fq)) (- ceiling-bytes live-overhead)))
                             (useq (max qi (min max-qi (+ fq qi-bias))))
                             ;; WHEN THE WHOLE SCREEN CHANGED, A KEYFRAME IS THE CHEAP WAY TO
                             ;; COVER IT.  An inter macroblock cannot use intra prediction, so
                             ;; coding 4000 unrelated macroblocks as a delta costs about twice
                             ;; what the same picture costs as a keyframe — and the keyframe
                             ;; needs no reference, so it also cannot inherit anyone's drift.
-                            ;; Both estimates are learned from this encoder's own output, so
-                            ;; this compares two measurements rather than two guesses.
+                            ;;
+                            ;; UNRELATED is the word doing the work.  Four thousand macroblocks
+                            ;; that all moved together are not unrelated and not expensive: they
+                            ;; are the case a keyframe handles WORST, since it re-sends as new
+                            ;; content the very pixels the viewer already holds.  So the inter
+                            ;; estimate prices the two populations separately (see the model at
+                            ;; the top of this file) and a translation can no longer talk itself
+                            ;; into a keyframe just by being large.
                             (key-cheaper (and enc y (> nwant (* 0.8 mbs))
-                                              (> (* nwant bpu (qi-cost useq))
+                                              (> (+ mv-bytes (* nnew bpu (qi-cost useq)))
                                                  (* mbs kpu (qi-cost kqi)))))
                             (need-key (or (null enc) forced key-due key-cheaper))
                             (frame
@@ -545,34 +594,60 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                        ;; deferral survives for exactly one case: even MAX-QI
                                        ;; overruns the ceiling, so code what fits and carry the
                                        ;; rest.  On this ladder that is now rare rather than the
-                                       ;; normal path.
+                                       ;; normal path.  MAX-MBS bounds macroblocks that CODE, so
+                                       ;; the translating part is charged to the overhead here
+                                       ;; too and is not rationed.
                                        (cap (unless fits
-                                              (mbs-fitting ceiling-bytes bpu overhead useq))))
-                                   (multiple-value-bind (f nmb defer mv eqi)
+                                              (mbs-fitting ceiling-bytes bpu live-overhead useq))))
+                                   (multiple-value-bind (f nmb defer mv eqi nmoved)
                                            (with-timing (st-enc)
                                              (vp8::encode-inter-frame
                                               enc y u v :qi useq :dirty want :force t
-                                              :clean-qi qi :max-mbs cap))
+                                              :clean-qi qi :max-mbs cap
+                                              ;; the vector the estimate was made on.  :NONE when
+                                              ;; the estimate found none — the encoder's own
+                                              ;; search runs on the same pixels behind the same
+                                              ;; gates, so it would find none either, and saying
+                                              ;; so saves it the pass.
+                                              :motion (if mvp (or gmv :none) nil)))
                                          (declare (ignore mv))
                                          (setf pending defer)
                                          (when eqi (setf useq eqi))
                                          (setf cur-qi useq
                                                stale-qi (if (> useq qi)
                                                             (max stale-qi useq) stale-qi))
+                                         (when nmoved (ps-note st-mv nmoved))
                                          (when nmb
                                            (ps-note st-mbs nmb)
-                                           ;; keep the cost estimate honest, at the quantizer the
-                                           ;; encoder actually used
-                                           (when (and f (>= nmb 16))
-                                             ;; asymmetric on purpose: a frame that came out
-                                             ;; bigger than predicted has already cost the link
-                                             ;; the overrun, so believe it immediately; one that
-                                             ;; came out smaller only means we were cautious.
-                                             (let ((m (/ (max 1d0 (- (length f) overhead))
-                                                         nmb (qi-cost useq))))
-                                               (setf bpu (if (> m bpu)
-                                                             (+ (* 0.4d0 bpu) (* 0.6d0 m))
-                                                             (+ (* 0.85d0 bpu) (* 0.15d0 m)))))))
+                                           ;; KEEP BOTH ESTIMATES HONEST, from the counts the
+                                           ;; encoder actually reports rather than the ones we
+                                           ;; predicted.  Two terms, one measurement, so they are
+                                           ;; learned from different frames: a frame that is
+                                           ;; almost entirely translation is the only one that
+                                           ;; says what a translation costs, and every other
+                                           ;; frame has its (now known) translation subtracted
+                                           ;; before it says what a coefficient costs.
+                                           (let ((payload (and f (max 1d0 (- (length f) overhead))))
+                                                 (nm (or nmoved 0)))
+                                             (cond
+                                               ((null payload))
+                                               ((and (> nm 64) (< nmb (max 8 (floor nm 8))))
+                                                (let ((m (/ payload nm)))
+                                                  (setf mpu (max 0.1d0
+                                                                 (min 8d0
+                                                                      (+ (* 0.7d0 mpu)
+                                                                         (* 0.3d0 m)))))))
+                                               ;; asymmetric on purpose: a frame that came out
+                                               ;; bigger than predicted has already cost the link
+                                               ;; the overrun, so believe it immediately; one that
+                                               ;; came out smaller only means we were cautious.
+                                               ((>= nmb 16)
+                                                (let ((m (/ (max 1d0 (- payload (* nm mpu)))
+                                                            nmb (qi-cost useq))))
+                                                  (setf bpu (if (> m bpu)
+                                                                (+ (* 0.4d0 bpu) (* 0.6d0 m))
+                                                                (+ (* 0.85d0 bpu)
+                                                                   (* 0.15d0 m)))))))))
                                          ;; THE QUANTIZER CONTROLLER, and it reads the encoder's
                                          ;; OWN OUTPUT, before pacing.  The old one compared
                                          ;; post-pacing throughput with the target — but the pacer
@@ -621,20 +696,23 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       :capture-fps (/ (* 1000d0 takes) dt)
                                       :qi cur-qi :qi-bias qi-bias
                                       :bytes-per-mb (* bpu (qi-cost cur-qi))
+                                      :moved-mb (list (ps-min st-mv) (/ (ps-total st-mv) (max 1 (ps-n st-mv))) (ps-max st-mv))
+                                      :bytes-per-moved-mb mpu
                                       :pending (if pending (count 1 pending) 0)
                                       :cleanups cleanups)))
                      (when (and log (> dt 5000))
-                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (cap ~,1f) | qi ~a~@[+~a~] b/mb ~,0f | pend ~a | cleans ~a"
+                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (cap ~,1f) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | cleans ~a"
                                             (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
                                             (ps-line st-send) (ps-line st-kb) (ps-line st-mbs)
+                                            (ps-line st-mv)
                                             sent skipped takes (/ bytes 1.024 dt)
                                             (/ (* 1000d0 sent) dt) (/ (* 1000d0 takes) dt)
                                             cur-qi (and (plusp qi-bias) qi-bias)
-                                            (* bpu (qi-cost cur-qi))
+                                            (* bpu (qi-cost cur-qi)) mpu
                                             (if pending (count 1 pending) 0) cleanups))
                        (ps-reset st-take) (ps-reset st-enc) (ps-reset st-send) (ps-reset st-loop)
                        (ps-reset st-clean) (ps-reset st-kb) (ps-reset st-mbs) (ps-reset st-qi)
-                       (ps-reset st-lag)
+                       (ps-reset st-mv) (ps-reset st-lag)
                        (setf sent 0 skipped 0 bytes 0 takes 0 cleanups 0
                              last-report (get-internal-real-time)))))
                (error (e) (when log (funcall log (format nil "video tx: ~a" e)))))
