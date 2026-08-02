@@ -287,12 +287,19 @@ Returns a STOP thunk."
                            ;; PACE THE BURST.  A keyframe is ~75 packets; handing them all to the
                            ;; socket at once is a microburst that overruns a queue somewhere on the
                            ;; relay path, and a VP8 keyframe missing ONE fragment is undecodable —
-                           ;; which looks exactly like "connected, receiving, no first frame".  Inter
-                           ;; frames are small enough to send as-is; anything big gets spread at
-                           ;; roughly the rate we are steering toward, so it arrives slightly later
-                           ;; but arrives whole.
-                           (let ((gap (and (> (length pkts) 8)
-                                           (/ (/ 1100d0 (* 1024 target-kbs)) 1))))
+                           ;; which looks exactly like "connected, receiving, no first frame".
+                           ;;
+                           ;; EVERY frame, not just the ones over eight packets.  That threshold
+                           ;; assumed inter frames are small relative to the link; on this ladder
+                           ;; they are not, and the drain and refinement paths emit them back to
+                           ;; back as fast as they encode.  Measured at 40 kbps: 15 KB in the 300 ms
+                           ;; after the keyframe, ten times the target, with nothing to stop it
+                           ;; until the rate controller's next 500 ms window.  The gap is derived
+                           ;; from the frame's ACTUAL bytes rather than a whole packet each, so a
+                           ;; 700-byte frame costs 700 bytes of time and not 1100.
+                           (let ((gap (and (plusp (length pkts))
+                                           (/ (length frame)
+                                              (* (length pkts) 1024d0 target-kbs)))))
                              (dolist (p pkts)
                                (unless sink
                                  (webrtc-data:ice-send-to-peer agent (srtp-protect ctx p)))
