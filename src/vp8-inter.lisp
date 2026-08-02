@@ -685,7 +685,10 @@ coding are left skipped and reported in the returned DEFERRED bit vector so the 
 them into the next frame.  That bounds FRAME SIZE, which is what actually bounds latency: one
 143 KB frame is ~570 ms in flight on a 250 KB/s link, and no average-rate control can see that.
 A big change then arrives as a couple of progressive frames instead of one long stall.
-Returns (values bytes coded-mb-count deferred motion-vector)."
+Returns (values bytes coded-mb-count deferred motion-vector quantizer).  QUANTIZER is the one the
+frame was ACTUALLY coded at, which is not always QI — see the backlog rule above.  A caller that
+models what a quantizer costs has to be told which one it got, or its next estimate is wrong by
+whatever the encoder decided on its own."
   (declare (type (simple-array (unsigned-byte 8) (*)) y u v)
            (optimize (speed 3) (safety 1)))
   (let* ((mc (ve-mb-cols enc)) (mr (ve-mb-rows enc))
@@ -970,4 +973,4 @@ Returns (values bytes coded-mb-count deferred motion-vector)."
       (vector-push-extend (logand (ash tag -16) #xff) frame)
       (loop for b across p1 do (vector-push-extend b frame))
       (loop for b across p2 do (vector-push-extend b frame))
-      (values frame coded deferred (when use-mv (cons (- gmvx) (- gmvy)))))))
+      (values frame coded deferred (when use-mv (cons (- gmvx) (- gmvy))) eqi))))
