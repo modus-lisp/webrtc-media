@@ -118,6 +118,18 @@ dirties a large part of the screen; a blinking cursor does not, and is not worth
   ;; macroblocks last coded at a degraded quantizer.  When the screen goes quiet we re-code just
   ;; these at a low qi, so a burst of motion leaves no lasting mush behind.
   (stale-mbs nil :type (or null simple-bit-vector))
+  ;; macroblocks the viewer has NEVER BEEN SHOWN — deferred for want of bytes, so the decoder
+  ;; still holds whatever was there before and this encoder still owes the content.
+  ;;
+  ;; SEPARATE FROM STALE-MBS ON PURPOSE, and the two used to be one bit.  They answer different
+  ;; questions: stale is "the viewer has this, coarser than we would like" and drives the idle
+  ;; refinement; unsent is "the viewer does not have this" and is the only thing a motion vector
+  ;; may not carry.  Conflated, a coarse keyframe — which delivers the WHOLE screen — marked every
+  ;; macroblock un-carryable, so the next frame of a scroll could translate nothing, priced the
+  ;; whole screen as new content, and sent another keyframe, which marked everything again.  A
+  ;; scroll never escaped: measured at 1280x800, a 19 KB inter frame where 4.5 KB was available,
+  ;; and the sender rightly preferring a 22 KB keyframe to it, for ever.
+  (unsent-mbs nil :type (or null simple-bit-vector))
   (motion nil)                                 ; MOTION-STATE, allocated on first use
   (have-ref nil) (frames 0))
 
@@ -128,6 +140,7 @@ dirties a large part of the screen; a blinking cursor does not, and is not worth
    (mv-row :accessor ms-mv-row :initarg :mv-row)   ; per-MB coded vector, 1/8 pel, this frame
    (mv-col :accessor ms-mv-col :initarg :mv-col)
    (was-stale :accessor ms-was-stale :initarg :was-stale)
+   (was-unsent :accessor ms-was-unsent :initarg :was-unsent)
    (last-mv :accessor ms-last-mv :initform nil))   ; vector accepted last frame: a strong prior
   (:documentation
    "State the motion path needs to live across frames: a SECOND reconstruction buffer, and the
@@ -151,7 +164,8 @@ are the same array and the old in-place path is untouched."))
                :cur-v (make-array (* (ve-cw enc) (ve-chh enc)) :element-type '(unsigned-byte 8))
                :mv-row (make-array n :element-type '(signed-byte 16) :initial-element 0)
                :mv-col (make-array n :element-type '(signed-byte 16) :initial-element 0)
-               :was-stale (make-array n :element-type 'bit :initial-element 0))))))
+               :was-stale (make-array n :element-type 'bit :initial-element 0)
+               :was-unsent (make-array n :element-type 'bit :initial-element 0))))))
 
 (defun make-encoder (width height)
   (let* ((mc (ceiling width 16)) (mr (ceiling height 16))
@@ -163,7 +177,10 @@ are the same array and the old in-place path is untouched."))
                :prev-y (make-array (* width height) :element-type '(unsigned-byte 8) :initial-element 0)
                :prev-u (make-array (* (ceiling width 2) (ceiling height 2)) :element-type '(unsigned-byte 8) :initial-element 0)
                :prev-v (make-array (* (ceiling width 2) (ceiling height 2)) :element-type '(unsigned-byte 8) :initial-element 0)
-               :stale-mbs (make-array (* mc mr) :element-type 'bit :initial-element 0))))
+               :stale-mbs (make-array (* mc mr) :element-type 'bit :initial-element 0)
+               ;; a fresh encoder owes nothing: the first frame it codes is a keyframe, which
+               ;; delivers every macroblock by construction
+               :unsent-mbs (make-array (* mc mr) :element-type 'bit :initial-element 0))))
 
 ;;; ---- neighbour vectors (libvpx vp8_find_near_mvs) --------------------------
 ;;;
@@ -716,7 +733,8 @@ case TRANSLATING is 0 and every changed macroblock is new content.
 
 TRANSLATING is the encoder's own test, not an approximation of it: a macroblock counts only if the
 vector's prediction lies wholly inside the reference, the pixels it would carry are ones the viewer
-HAS (nothing stale travels), and luma and chroma both reproduce exactly.  What is approximate is
+HAS (nothing UNSENT travels — coarse is fine, undelivered is not), and luma and chroma both
+reproduce exactly.  What is approximate is
 the CENSUS — every SAMPLE-th changed macroblock is tested and the count scaled — because the
 answer only has to be good enough to choose between two frame types, and testing all of them would
 cost as much as the encode it is meant to inform.
@@ -742,7 +760,10 @@ answer here means the encoder would have found nothing either."
              (sw (ceiling w 2)) (sh (ceiling h 2))
              (pw (ve-pw enc)) (ph (ve-ph enc)) (cw (ve-cw enc)) (chh (ve-chh enc))
              (py (ve-prev-y enc)) (pu (ve-prev-u enc)) (pv (ve-prev-v enc))
-             (stale (ve-stale-mbs enc))
+             ;; the DELIVERY set, not the quality one — same reasoning as the MOVED gate in
+             ;; ENCODE-INTER-FRAME, and it has to be the same test or this estimate would predict
+             ;; a translation the encoder then refuses (or the reverse)
+             (unsent (ve-unsent-mbs enc))
              (ftmp (make-array 104 :element-type '(signed-byte 32)))
              (cbuf (make-array 64 :element-type '(unsigned-byte 8)))
              (step (max 1 sample)) (seen 0) (tried 0) (hit 0))
@@ -755,7 +776,7 @@ answer here means the encoder would have found nothing either."
                   (incf tried)
                   (let ((ox (* 16 mbx)) (oy (* 16 mby)) (cx (* 8 mbx)) (cy (* 8 mby)))
                     (when (and (%mv-fits-p mbx mby gmvx gmvy pw ph cw chh)
-                               (not (and stale (%region-stale-p stale mc mr ox oy gmvx gmvy)))
+                               (not (and unsent (%region-marked-p unsent mc mr ox oy gmvx gmvy)))
                                (%mb-moved-p y py w h ox oy gmvx gmvy 16)
                                (%mb-moved-chroma-p u pu sw sh cx cy gmvx gmvy ftmp cbuf)
                                (%mb-moved-chroma-p v pv sw sh cx cy gmvx gmvy ftmp cbuf))
@@ -800,17 +821,20 @@ reconstruction into CUR.  Returns T if anything was coded."
                                      (aref rec i)))))))))
     any))
 
-(defun %region-stale-p (was-stale mc mr ox oy mvx mvy)
-  "T if any macroblock the translated block at (OX+MVX, OY+MVY) reads from has NOT converged in
-the decoder — coded coarsely, or deferred and so never sent at all.  A vector may only carry
-pixels the viewer actually has; carrying stale ones is how one un-sent macroblock spreads."
-  (declare (type simple-bit-vector was-stale) (type fixnum mc mr ox oy mvx mvy)
+(defun %region-marked-p (marks mc mr ox oy mvx mvy)
+  "T if any macroblock the translated block at (OX+MVX, OY+MVY) reads from is flagged in MARKS.
+
+Used with the UNSENT set to gate a vector — a vector may only carry pixels the viewer actually
+has, and carrying un-sent ones is how one deferred macroblock spreads across the screen — and with
+the STALE set to propagate quality, so a macroblock that arrives by translation inherits the
+sharpness of wherever it came from and the idle pass still knows to come back for it."
+  (declare (type simple-bit-vector marks) (type fixnum mc mr ox oy mvx mvy)
            (optimize (speed 3) (safety 0)))
   (loop for (dx dy) in '((0 0) (15 0) (0 15) (15 15))
           thereis (let ((bx (floor (+ ox mvx (the fixnum dx)) 16))
                         (by (floor (+ oy mvy (the fixnum dy)) 16)))
                     (and (>= bx 0) (< bx mc) (>= by 0) (< by mr)
-                         (= 1 (aref was-stale (+ (* by mc) bx)))))))
+                         (= 1 (aref marks (+ (* by mc) bx)))))))
 
 (defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12) max-mbs motion)
   "Encode one inter frame of Y/U/V against the encoder's reference, updating the reference in
@@ -896,7 +920,8 @@ caller learning what a translation costs learns it from the count that actually 
          (cu (if use-mv (ms-cur-u ms) ru))
          (cv (if use-mv (ms-cur-v ms) rv))
          (mvr (when use-mv (ms-mv-row ms))) (mvc (when use-mv (ms-mv-col ms)))
-         (was-stale (when use-mv (ms-was-stale ms))))
+         (was-stale (when use-mv (ms-was-stale ms)))
+         (was-unsent (when use-mv (ms-was-unsent ms))))
     (declare (type fixnum gmvx gmvy coded translated)
              (type (simple-array (unsigned-byte 8) (*)) cy cu cv)
              (type (simple-array (unsigned-byte 8) (256)) py)
@@ -909,7 +934,10 @@ caller learning what a translation costs learns it from the count that actually 
       (fill (the (simple-array (signed-byte 16) (*)) mvc) 0)
       (if (ve-stale-mbs enc)
           (replace (the simple-bit-vector was-stale) (the simple-bit-vector (ve-stale-mbs enc)))
-          (fill (the simple-bit-vector was-stale) 0)))
+          (fill (the simple-bit-vector was-stale) 0))
+      (if (ve-unsent-mbs enc)
+          (replace (the simple-bit-vector was-unsent) (the simple-bit-vector (ve-unsent-mbs enc)))
+          (fill (the simple-bit-vector was-unsent) 0)))
     (when ms (setf (ms-last-mv ms) (and use-mv gmv)))
     ;; ---- frame header (inter variant, RFC 6386 s9) ----
     (bwrite-literal bw 0 1)                      ; segmentation_enabled
@@ -968,8 +996,16 @@ caller learning what a translation costs learns it from the count that actually 
                ;; last frame was never sent, so translating from it hands the viewer content it
                ;; never received, marks nothing dirty, and drops the debt.  A whole scroll then
                ;; smears un-sent content across the screen and only a keyframe repairs it.
+               ;;
+               ;; HAS, NOT HAS SHARPLY.  This asks the UNSENT set, not the stale one.  A
+               ;; macroblock the viewer holds at a coarse quantizer is a macroblock the viewer
+               ;; holds: translating it moves a coarse picture, the encoder's reference moves the
+               ;; same coarse picture, the two stay in step, and the stale mark travels with it so
+               ;; the idle pass still sharpens it where it lands.  Refusing to move it instead
+               ;; prices a scroll as a screenful of new content — which after a coarse keyframe is
+               ;; every macroblock, every frame, permanently.
                (moved (and mvable
-                           (not (%region-stale-p was-stale mc mr ox oy gmvx gmvy))
+                           (not (%region-marked-p was-unsent mc mr ox oy gmvx gmvy))
                            (%mb-moved-p y (ve-prev-y enc) w h ox oy gmvx gmvy 16)
                            (%mb-moved-chroma-p u (ve-prev-u enc) sw sh cx cy2 gmvx gmvy ftmp cbuf)
                            (%mb-moved-chroma-p v (ve-prev-v enc) sw sh cx cy2 gmvx gmvy ftmp cbuf)))
@@ -983,10 +1019,11 @@ caller learning what a translation costs learns it from the count that actually 
           (when over
             (unless deferred (setf deferred (make-array (* mc mr) :element-type 'bit :initial-element 0)))
             (setf (aref (the simple-bit-vector deferred) mbi) 1)
-            ;; the viewer has NOT been shown this macroblock — the strongest form of stale.  Say so:
-            ;; the idle refinement then comes back for it even if the carry-forward is lost, and
+            ;; the viewer has NOT been shown this macroblock.  Both sets: STALE so the idle
+            ;; refinement comes back for it even if the carry-forward is lost, and UNSENT so
             ;; nothing translates from it while it is still owed.
-            (let ((st (ve-stale-mbs enc))) (when st (setf (aref st mbi) 1))))
+            (let ((st (ve-stale-mbs enc))) (when st (setf (aref st mbi) 1)))
+            (let ((un (ve-unsent-mbs enc))) (when un (setf (aref un mbi) 1))))
           ;; choose the prediction: the global vector only if it beats the co-located one
           (cond
             (moved (setf mvx gmvx mvy gmvy))
@@ -1048,11 +1085,24 @@ caller learning what a translation costs learns it from the count that actually 
                  (let ((st (ve-stale-mbs enc)))
                    (when st
                      (setf (aref st mbi)
-                           (if (%region-stale-p was-stale mc mr ox oy mvx mvy) 1 0))))))
+                           (if (%region-marked-p was-stale mc mr ox oy mvx mvy) 1 0))))
+                 ;; and the debt travels with the pixels too.  It should always be 0 here — the
+                 ;; MOVED gate above refuses an unsent source — but a vector chosen by the
+                 ;; SAD comparison below reaches this branch without that gate, so say it
+                 ;; rather than assume it.
+                 (let ((un (ve-unsent-mbs enc)))
+                   (when un
+                     (setf (aref un mbi)
+                           (if (and was-unsent
+                                    (%region-marked-p was-unsent mc mr ox oy mvx mvy))
+                               1 0))))))
               (t
                (incf coded)
                (let ((st (ve-stale-mbs enc)))
                  (when st (setf (aref st mbi) (if (> eqi clean-qi) 1 0))))
+               ;; coded is DELIVERED, whatever quantizer it went out at: the debt is settled here
+               ;; and only here (and by a keyframe, which builds a fresh encoder)
+               (let ((un (ve-unsent-mbs enc))) (when un (setf (aref un mbi) 0)))
                ;; build the prediction for this macroblock, then code the residual against it
                (%copy-pred ry pw (+ ox mvx) (+ oy mvy) py 16)
                (if moving
