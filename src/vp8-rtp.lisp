@@ -199,6 +199,160 @@ genuinely new content still arrives whole, in one slow frame, exactly as it did 
         (values q budget t)
         (values q ceiling (<= (* n bpu (qi-cost q)) (max 0 (- ceiling overhead)))))))
 
+;;; ---- resolution follows damage ---------------------------------------------
+;;;
+;;; The quantizer is not the last lever, and by this point it is not the binding one either.  Two
+;;; ceilings are left, and NEITHER of them is a bitrate — both are counts of macroblocks:
+;;;
+;;;   1. THE KEYFRAME FLOOR.  A change with no usable vector has to be coded as a keyframe (see
+;;;      KEY-CHEAPER), and the cheapest keyframe VP8 can code is ~5.5 bytes per macroblock at
+;;;      qi 127, the coarsest quantizer the format has.  At 1280x800 that is 22 KB, so a
+;;;      full-screen scroll cannot exceed 1.8 frames a second at 320 kbps, 0.9 at 160, 0.45 at 80,
+;;;      0.23 at 40, whatever else is done to it.  Measured scroll: 1.17 fps of a possible 1.8 —
+;;;      sitting on this ceiling, not on the byte budget.
+;;;
+;;;   2. MOTION-SEARCH REACH.  A vector component is +-255 px.  When frames are seconds apart a
+;;;      scroll displaces ~400 px between the ones actually delivered, so no vector exists, so the
+;;;      frame is priced as a keyframe, so the next gap is longer and the next displacement bigger.
+;;;      It reinforces itself, and no amount of bitrate breaks it.
+;;;
+;;; Halving the resolution quarters the macroblocks and takes all three numbers with it: the
+;;; keyframe, the per-frame skip flags, AND the displacement — 400 px becomes 200, back inside the
+;;; search range where a scroll costs a mode bit instead of a picture.
+;;;
+;;; SO WHY NOT SIMPLY RUN SMALL.  Because a resolution switch is a keyframe (VP8's size is a
+;;; per-frame property; there is no way to code a small region inside a large frame), and because
+;;; most damage is not global.  A menu opening, a cursor, a line of text: those are twenty
+;;; macroblocks, the other 3980 are already correct at full resolution in the viewer's decoder, and
+;;; they cost one skip bit each to keep.  Dropping resolution for that destroys delivered detail
+;;; AND pays a keyframe to destroy it.  Whereas a page load or a scroll the search cannot track has
+;;; no preserved detail to protect: everything is changing anyway, so the only question is how many
+;;; macroblocks the change is spread over, and that is the one thing we can choose.
+;;;
+;;; Hence: FULL RESOLUTION BY DEFAULT, drop when the damage is genuinely global, restore when the
+;;; screen goes quiet.  And MEASURE THE DAMAGE BY MACROBLOCK COUNT, SPLIT INTO TRANSLATION AND NEW
+;;; CONTENT — never by bounding box.  A window dragged across the screen has an enormous bounding
+;;; box and almost no new content; it is already cheap, because the vector carries it.  A rule
+;;; written on bbox area would drop resolution for exactly the case that had stopped needing it.
+
+(defvar *video-scale* 1
+  "The resolution divisor the frame source is being asked for: 1, 2 or 4.  The SENDER owns this —
+it is set from the damage the encoder actually saw — and the source reads it when it next produces
+a frame.  A source that ignores it simply never changes resolution, which is the old behaviour.")
+
+(defun video-scale () *video-scale*)
+
+(defparameter *keyframe-floor-per-mb* 5.53d0
+  "Bytes per macroblock in the cheapest keyframe VP8 can produce: measured, 22116 bytes over the
+4000 macroblocks of a 1280x800 screen at qi 127.  Stated per macroblock because that is what it is
+a function of — this number is why resolution, and only resolution, moves the keyframe floor.")
+
+(defparameter *motion-frame-secs* 0.75d0
+  "The longest a whole-screen frame may take on the wire and still read as MOTION.  Past about this
+the screen is a slideshow and the individual pictures being sharper does not help; it is also
+roughly where a scroll's inter-frame displacement passes VP8's +-255 px vector range, so the frames
+stop being able to reference each other at all.")
+
+(defparameter *scale-drop-dwell-secs* 0.5d0
+  "The least time between one resolution switch and the next drop.  A drop is cheap — its keyframe
+is at the SMALLER size — so this is short.")
+
+(defparameter *scale-lost-frames* 2
+  "How many whole-screen frames in a row may find NO motion vector before resolution drops,
+whatever the rate says.
+
+This is the second ceiling caught in the act rather than predicted.  A vector component reaches
++-255 px, and — because a probe can only vote for a displacement that keeps it inside the frame —
+the practical reach is well under that: measured, a scroll is tracked at 96 px and lost at 170 on a
+640x400 picture.  So when frames are far apart the picture moves further than the search can follow,
+the frame prices as a screenful of new content, it goes out as a keyframe, and the keyframe's own
+size sets the gap to the next one — which is at least as large.  Nothing in the rate breaks the
+loop; only shrinking the picture does, because that divides the displacement too.
+
+A RUN, not one frame, and that is what separates a SCROLL from a WINDOW SWITCH.  A switch is one
+vector-less whole-screen frame and then a still screen — a keyframe is the right answer and there
+is nothing to escape.  A scroll produces them without end.  At 320 kbps, where the rate rule alone
+never drops, this is the only thing that does: measured there, eight consecutive 24 KB keyframes at
+1.17 fps, every one of them because 0.85 s of scrolling is 408 px and the search cannot see that
+far.")
+
+(defparameter *video-scales* '(1 2 4))
+
+(defparameter *first-picture-mbs* 200
+  "The fewest macroblocks the FIRST picture of a session is allowed to be reduced to.  At 1280x800
+a quarter is 260, which is a recognisable desktop — you can see where the windows are and which one
+has focus — and 1.4 KB.  Below a couple of hundred macroblocks it stops being a picture.")
+
+(defparameter *scale-climb-secs* 0.3d0
+  "How long the screen must be still before the first picture climbs one step towards full size.
+
+Short, and it can afford to be: the encoder does not run at all while the link is busy, so by the
+time this is even consulted the previous step has been delivered in full.  It is a debounce, not a
+hysteresis — the hysteresis that matters (SCALE-RESTORE-SECS) exists to keep a PAUSE IN A SCROLL
+from buying a full-size keyframe, and at session start there is no scroll to pause.")
+
+(defun scale-for-first-picture (full-mbs)
+  "The resolution the FIRST picture of a session should be coded at: the smallest that is still
+worth looking at.
+
+TIME TO FIRST PIXELS IS NOT TIME TO A COMPLETE PICTURE, and the first is what a session is judged
+on.  A whole screen at 1280x800 cannot be sent in under 22 KB whatever the quantizer, which is 4.4
+seconds of a 40 kbps link and 8.8 of a 20 kbps one — seconds in which the viewer has NOTHING, not a
+rough version of something.  The same screen at a quarter of the size is 1.4 KB: a third of a
+second, blurry, and unmistakably the desktop.  Nobody would choose the blurry one to KEEP, and
+nobody has to — it is replaced by a half-size picture and then a full-size one as fast as the link
+will carry them (see the climb in START-VIDEO).  What they would choose is to see something."
+  (or (car (last (remove-if (lambda (s) (< (/ full-mbs (* s s)) *first-picture-mbs*))
+                            *video-scales*)))
+      1))
+
+(defun scale-for-motion (bytes-per-sec full-mbs)
+  "The resolution divisor at which a WHOLE-SCREEN change can still be delivered as motion at this
+rate.  The cheapest such frame is a keyframe, its price is *KEYFRAME-FLOOR-PER-MB* per macroblock,
+and a divisor of S has 1/S^2 of the macroblocks.  FULL-MBS is the macroblock count at full size.
+
+This is the rung's EAGERNESS, and it is a derivation rather than a table: at 320 kbps a 1280x800
+keyframe is 0.55 s of link and the answer is 1 — full resolution, never drop, the detail is worth
+more than the cadence.  At 160 and 80 it is 2, at 40 and below it is 4."
+  (or (find-if (lambda (s)
+                 (<= (/ (* *keyframe-floor-per-mb* full-mbs) (* s s) (max 1d0 bytes-per-sec))
+                     *motion-frame-secs*))
+               *video-scales*)
+      (car (last *video-scales*))))
+
+(defun scale-drop-fraction (bytes-per-sec full-mbs)
+  "How much of the screen must be GENUINELY NEW — changed and not accounted for by the frame's
+motion vector — before dropping resolution is worth its keyframe.  The same arithmetic as
+SCALE-FOR-MOTION read the other way round: the fraction of a full-size screen this rate can still
+recode inside *MOTION-FRAME-SECS*.  Above that fraction the frame is too big to arrive in time and
+the macroblocks have to go somewhere; below it, full resolution is affordable and preferable.
+
+At 320 kbps this comes out at 1.0 — nothing short of the entire screen, and SCALE-FOR-MOTION says 1
+there anyway.  At 160 it is ~0.68, at 80 ~0.34, and at 40 and below it floors at 0.25: down there
+a quarter of the screen changing at once is already more than the link can carry at full size."
+  (max 0.25d0 (min 1d0 (/ (* (max 1d0 bytes-per-sec) *motion-frame-secs*)
+                          (* *keyframe-floor-per-mb* (max 1 full-mbs))))))
+
+(defun scale-restore-secs (bytes-per-sec full-mbs)
+  "How long the screen must be QUIET before full resolution is restored.
+
+THE HYSTERESIS IS DELIBERATELY ASYMMETRIC because the two switches do not cost the same.  Dropping
+is cheap: its keyframe is at the smaller size, 1.4 KB at quarter resolution where the full-size one
+is 22 KB.  Restoring costs the full-size keyframe, so it must not happen on a pause in a scroll —
+pay 4.4 s of a 40 kbps link for a picture that is stale again before it lands and you have made
+both resolutions worse than either.  So the wait is the RESTORE'S OWN PRICE IN SECONDS: about as
+long as the keyframe it is about to send will take to arrive.  A scroll that has been still that
+long has stopped.
+
+THE FLOOR IS A PROPERTY OF HANDS, NOT OF THE LINK.  Above about 80 kbps the restore keyframe is
+quick enough that its own price would allow a wait of a second or less — and a second is shorter
+than the gap between two flicks of a scroll wheel.  Measured at 160 kbps with a 1.5 s floor, on a
+scroll that moved for 1.5 s and rested for 2.0, twelve times over: thirteen resolution switches and
+five full-size keyframes, 200 KB spent restoring a picture that was stale again before it landed.
+At 2.5 s the same scroll switches twice."
+  (max 2.5d0 (min 10d0 (/ (* *keyframe-floor-per-mb* (max 1 full-mbs))
+                          (max 1d0 bytes-per-sec)))))
+
 ;;; ---- switching quality under a running sender ------------------------------
 ;;; Every knob START-VIDEO takes is consulted on each pass of the encode loop, not baked into the
 ;;; frame pipeline at startup — so a profile can be swapped while the stream runs.  That is the
@@ -289,6 +443,22 @@ post-pacing throughput with the target, which the pacer produces by construction
 'on target' for ever and never coarsened at all.  Then, once the screen has been quiet for
 CLEANUP-MS, whatever was coded coarsely is re-coded finer, a whole screen at a time.
 
+AND RESOLUTION IS A LEVER TOO — the last one, and past a certain point the only one that moves.
+A keyframe's price is a MACROBLOCK COUNT (~5.5 bytes each at the coarsest quantizer VP8 has), the
+per-frame skip flags are a macroblock count, and VP8's +-255 px vector range is a distance the
+picture may move BETWEEN DELIVERED FRAMES — which at one frame every few seconds a scroll exceeds,
+losing the vector and turning every frame into a keyframe.  All three ease by S^2 (or S) when the
+source is asked for 1/S of the picture, so the sender asks: it publishes *VIDEO-SCALE* and a source
+that honours it hands back a box-filtered desktop at that size.  The frame-size mismatch then
+drives the resize path that already existed here, which is a keyframe — and that is exactly why the
+switch is not free and not frequent.  FULL RESOLUTION IS THE DEFAULT and local damage keeps it: the
+macroblocks that did not change are already correct in the viewer's decoder and cost a bit each to
+say so, and there is no version of dropping resolution for a cursor that is not simply throwing
+delivered detail away.  What earns a switch is damage that is GENUINELY GLOBAL — measured as
+changed macroblocks minus translating ones, never as a bounding box — because then there is no
+preserved detail to protect.  See SCALE-FOR-MOTION, SCALE-DROP-FRACTION and SCALE-RESTORE-SECS for
+the policy; the hysteresis is asymmetric because the two switches do not cost the same.
+
 SINK, when given, replaces the SRTP send with (funcall SINK frame) once per frame, after that
 frame's packets have been paced — so a measurement harness sees exactly what a receiver would
 have reassembled, when it would have had it.  Returns a STOP thunk."
@@ -311,6 +481,10 @@ have reassembled, when it would have had it.  Returns a STOP thunk."
          (st-mv (make-pstat :name "movedMB"))
          (st-lag (make-pstat :name "lag"))
          (sent 0) (bytes 0) (skipped 0) (takes 0))
+    ;; a session starts at full resolution as far as the SOURCE is concerned; the first frame's own
+    ;; damage is what decides whether it stays there (see the SWITCHED binding below).  Set here
+    ;; rather than left over from whatever the last session ended on.
+    (setf *video-scale* 1)
     (labels ((link-busy-p ()
                "Is anything still on its way out?  The encoder waits for this rather than for a
 sleep, which is what keeps the capture clock independent of the link rate."
@@ -389,6 +563,21 @@ sleep, which is what keeps the capture clock independent of the link rate."
                ;; size those two produce
                (fps-want 0d0) (fps-cap 0d0) (frame-budget 0)
                (cur-qi qi) (qi-bias 0) (stale-qi qi)
+               ;; THE RESOLUTION DIVISOR NOW IN FORCE, and when it last changed.  SCALE-AT starts
+               ;; at zero rather than at "now" so the FIRST picture is free to be small: a session
+               ;; start is global damage by definition, there is no delivered detail to protect,
+               ;; and at 40 kbps it is the difference between a picture in 0.4 s and one in 5.9 s.
+               (sc 1) (scale-at 0) (scale-drops 0) (scale-ups 0) (lost-run 0)
+               ;; CLIMBING is on from the first picture until the stream reaches full size without
+               ;; the desktop having moved.  While it is on, going back up is a fast STEP rather
+               ;; than the slow jump the steady-state rule makes — see *SCALE-CLIMB-SECS*.
+               (climbing nil)
+               ;; the divisor of the last frame that actually WENT OUT.  A switch is a request:
+               ;; SC changes, the frame is skipped, and the picture at the new size does not exist
+               ;; until the source has answered and the encoder has coded it.  Climbing on SC
+               ;; alone skipped straight past half size — two switches in the same millisecond,
+               ;; and the viewer never saw the middle step at all.
+               (sc-coded 1)
                ;; RESYNC ON A WALL CLOCK, not on source activity, and at a RATE-SCALED interval.
                ;; A keyframe is ~22 KB whatever we do to it, so at 40 kbps a 3 s resync is 16 s of
                ;; channel time per 3 s of wall clock.  That is not "overhead", it is a stream that
@@ -439,9 +628,14 @@ sleep, which is what keeps the capture clock independent of the link rate."
                            (setf cap-y y cap-u u cap-v v cap-w w cap-h h
                                  idle-since now)
                            ;; the dirty sets ACCUMULATE: several screen updates may land between
-                           ;; two frames, and the one we code has to cover all of them
+                           ;; two frames, and the one we code has to cover all of them.
+                           ;; UNLESS THE GRID CHANGED UNDER THEM.  A resolution switch restates
+                           ;; damage on a different macroblock grid, so the accumulated set is
+                           ;; not merely stale, it is a different length — BIT-IOR would error and
+                           ;; the frame it described no longer exists.  Start again from the new
+                           ;; one, which a switching source reports as the whole screen anyway.
                            (if dirty
-                               (if cap-dirty
+                               (if (and cap-dirty (= (length cap-dirty) (length dirty)))
                                    (bit-ior cap-dirty dirty cap-dirty)
                                    (setf cap-dirty (copy-seq dirty)))
                                (setf cap-scan t))))))
@@ -462,7 +656,19 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             (key-due (> (/ (float (- (get-internal-real-time) last-key))
                                            internal-time-units-per-second)
                                         key-secs))
-                            (mbs (if enc (* (vp8::ve-mb-cols enc) (vp8::ve-mb-rows enc)) 0))
+                            ;; THE FRAME IN HAND IS NOT THE SIZE THE ENCODER HOLDS.  Either the
+                            ;; desktop resized, or we asked the source for a different resolution
+                            ;; (see *VIDEO-SCALE*).  Everything that reaches across the two — the
+                            ;; motion search, the keyframe/inter comparison, the deferred set — is
+                            ;; reading one geometry against the other and must not run.
+                            (resized (and enc y (or (/= w (vp8::ve-width enc))
+                                                    (/= h (vp8::ve-height enc)))))
+                            ;; the macroblock count OF THE FRAME BEING CODED, which on the pass
+                            ;; that changes resolution is not the encoder's.  Overhead, the frame
+                            ;; budget and the fps ceiling are all functions of it.
+                            (mbs (cond ((and y w h) (* (ceiling w 16) (ceiling h 16)))
+                                       (enc (* (vp8::ve-mb-cols enc) (vp8::ve-mb-rows enc)))
+                                       (t 0)))
                             ;; the skip flag every macroblock pays whether it codes or not
                             (overhead (+ 64 (floor mbs 8)))
                             ;; the LATENCY ceiling, in seconds of link — what a frame with nothing
@@ -475,21 +681,35 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             ;; for.  This is the number that decides whether the next rung up buys
                             ;; more pictures or just a better one.
                             (bps (* target-kbs 1024))
+                            ;; TARGET-FPS ARRIVES SIZED FOR THE FULL-RESOLUTION SCREEN, because
+                            ;; that is where the rung derived it (a second of link over three
+                            ;; frames' worth of skip flags at 4000 macroblocks).  At a reduced
+                            ;; resolution both the flags and the encode are S^2 cheaper, so asking
+                            ;; for the same cadence would leave the whole point of the switch on
+                            ;; the floor.  Raise the REQUEST by S^2; the ceiling that actually
+                            ;; binds is still FRAME-FPS-CAP, computed from this frame's real
+                            ;; overhead, and *MAX-TARGET-FPS* still caps it at what the encoder
+                            ;; can produce.
+                            (sfps (min 12d0 (* (float (or target-fps 10) 1d0) sc sc)))
                             (plan (multiple-value-list
-                                   (motion-frame-budget bps target-fps overhead)))
+                                   (motion-frame-budget bps sfps overhead)))
                             (budget (first plan)) (feff (second plan)) (fcap (third plan))
                             ;; what this frame is being asked to cover, and the finest quantizer
-                            ;; that covers ALL of it inside the ceiling
+                            ;; that covers ALL of it inside the ceiling.  PENDING is dropped
+                            ;; outright when the grid changed under it — it names macroblocks of a
+                            ;; picture that is no longer the one being coded.
                             (want (cond ((null pending) dirty)
                                         ((null dirty) pending)
-                                        (t (bit-ior pending dirty))))
+                                        ((= (length pending) (length dirty))
+                                         (bit-ior pending dirty))
+                                        (t dirty)))
                             (nwant (if want (count 1 want) mbs))
                             ;; HOW MUCH OF THE CHANGE IS MERELY A TRANSLATION.  Asked before the
                             ;; frame is coded, because it is what decides HOW to code it — and
                             ;; asked of the encoder's own translation test rather than guessed, so
                             ;; the two terms below are both measurements.  The vector goes back
                             ;; into the encode below, so the search happens once per frame.
-                            (mvp (when (and enc y)
+                            (mvp (when (and enc y (not resized))
                                    (multiple-value-list
                                     (vp8::predict-motion enc y u v :dirty want))))
                             (gmv (first mvp))
@@ -500,6 +720,100 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             ;; off the top, exactly like the skip flags do.
                             (mv-bytes (* nmv mpu))
                             (live-overhead (+ overhead mv-bytes))
+                            ;; ---- RESOLUTION FOLLOWS DAMAGE -------------------------------
+                            ;; Decided HERE, before the frame is coded, from the two counts the
+                            ;; motion estimate has just produced — how much changed, and how much
+                            ;; of that merely moved.  Never from a bounding box: a window dragged
+                            ;; across the screen has an enormous one and almost no new content.
+                            ;;
+                            ;; A switch means the pixels in hand are the wrong size, so the frame
+                            ;; is SKIPPED rather than coded: coding it would spend the expensive
+                            ;; resolution on a picture we are about to replace, which on a session
+                            ;; start is the whole 22 KB we are trying not to send.  The source is
+                            ;; expected to answer the next poll at the new size (a scale change
+                            ;; produces a frame whether the screen changed or not), and if it does
+                            ;; not honour the request at all nothing is lost but one poll — the
+                            ;; decision cannot fire twice, since SC now equals what it asked for.
+                            (switched
+                              (let* ((tn (get-internal-real-time))
+                                     (dwell (/ (float (- tn scale-at))
+                                               internal-time-units-per-second))
+                                     (quiet (/ (float (- tn idle-since))
+                                               internal-time-units-per-second))
+                                     (full-mbs (* mbs sc sc))
+                                     (goal (scale-for-motion bps full-mbs)))
+                                (cond
+                                  ;; THE FIRST PICTURE OF THE SESSION, and it is not judged by the
+                                  ;; same rule as the rest.  Everything else here trades a picture
+                                  ;; the viewer already has against one it is about to get; this
+                                  ;; one trades against a BLANK SCREEN, so the only number that
+                                  ;; matters is how soon there are pixels.  Smallest size that is
+                                  ;; still a picture, at every rung including the top one — 1.4 KB
+                                  ;; and a third of a second at 40 kbps, against 22 KB and four and
+                                  ;; a half seconds of nothing — then climb.
+                                  ((and y (null enc) (> (scale-for-first-picture mbs) 1))
+                                   (setf sc (scale-for-first-picture mbs) scale-at tn
+                                         climbing t lost-run 0)
+                                   (incf scale-drops) t)
+                                  ;; ... and the climb.  One step at a time, as fast as each step
+                                  ;; can be delivered: quarter, half, full.  Stepping costs a
+                                  ;; keyframe per step and is still the cheaper trade — at 40 kbps
+                                  ;; the three of them together are 29 KB against 22, and they buy
+                                  ;; a picture at 0.3 s and a legible one at 1.5 instead of four
+                                  ;; and a half seconds of blank.
+                                  ((and climbing (> sc 1) (null y) (= sc-coded sc)
+                                        (>= quiet *scale-climb-secs*))
+                                   (setf sc (max 1 (floor sc 2)) scale-at tn lost-run 0)
+                                   (when (= sc 1) (setf climbing nil))
+                                   (incf scale-ups) t)
+                                  ;; genuinely global damage, and this rate cannot carry it at
+                                  ;; this size.  Drop the whole way at once — stepping down would
+                                  ;; buy two keyframes to reach one resolution.
+                                  ;;
+                                  ;; NOT ON A RESIZED FRAME, and that is not a detail: a frame that
+                                  ;; arrives at a new size reports the WHOLE SCREEN as damaged by
+                                  ;; construction, because the viewer has no picture at that size.
+                                  ;; Judged on its own damage, the frame that restores full
+                                  ;; resolution is always "global" and always immediately undoes
+                                  ;; itself — measured, before this line: up at 4.6 s, down at 5.5,
+                                  ;; up at 10.6, down at 11.8, for the whole session.  Damage WE
+                                  ;; caused is not evidence about the desktop.  Whatever the
+                                  ;; desktop is really doing shows up on the next frame, which is
+                                  ;; not resized and is judged normally.
+                                  ;;
+                                  ;; TWO CONDITIONS, AND THE FIRST IS WHAT PROTECTS A DRAG.  The
+                                  ;; damage has to cover most of the screen AND most of what it
+                                  ;; covers has to be new.  A dragged window fails the first: its
+                                  ;; damage is the union of two rectangles, a bit over half the
+                                  ;; screen — huge as a bounding box, and no more than that.  It
+                                  ;; can still fail the second when the drag is slow enough for
+                                  ;; the vector to carry it, but it must not be able to trip the
+                                  ;; rule on area alone, because area is precisely the number the
+                                  ;; motion vector has already made cheap.
+                                  ((and y (not resized) (> goal sc)
+                                        (> nwant (* 0.7 mbs))
+                                        (>= nnew (* (scale-drop-fraction bps full-mbs) mbs))
+                                        (>= dwell *scale-drop-dwell-secs*))
+                                   (setf sc goal scale-at tn lost-run 0 climbing nil)
+                                   (incf scale-drops) t)
+                                  ;; the search has lost the picture and no rate will find it
+                                  ;; again — halve, which halves the displacement too.  One step
+                                  ;; at a time here, because unlike the rule above this one does
+                                  ;; not know how far short it is; if half is still not enough the
+                                  ;; run simply builds again and it halves again.
+                                  ((and y (not resized) (< sc 4)
+                                        (>= lost-run *scale-lost-frames*)
+                                        (>= dwell *scale-drop-dwell-secs*))
+                                   (setf sc (min 4 (* sc 2)) scale-at tn lost-run 0 climbing nil)
+                                   (incf scale-drops) t)
+                                  ;; the screen has been still long enough that the full-size
+                                  ;; keyframe is worth its price.  Straight back to 1: there is no
+                                  ;; reason to arrive at half resolution on the way to full.
+                                  ((and (> sc 1) (null y)
+                                        (>= quiet (scale-restore-secs bps full-mbs)))
+                                   (setf sc 1 scale-at tn lost-run 0 climbing nil)
+                                   (incf scale-ups) t)
+                                  (t nil))))
                             ;; A BUDGET MAY NOT REFUSE THE MOTION ITSELF.  The frame's unavoidable
                             ;; cost is its skip flags plus a mode and a vector reference for every
                             ;; macroblock that merely moved, and none of that gets cheaper at a
@@ -544,11 +858,11 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             ;; estimate comes out under a keyframe's when the frame is really twice
                             ;; it — measured at 320 kbps: a 177 KB inter frame, 4.5 s of link, in
                             ;; place of a 105 KB keyframe that was sharper.
-                            (key-cheaper (and enc y (> nwant (* 0.8 mbs))
+                            (key-cheaper (and enc y (not resized) (> nwant (* 0.8 mbs))
                                               (or (< nmv (floor nwant 4))
                                                   (> (+ mv-bytes (* nnew bpu (qi-cost useq)))
                                                      (* mbs kpu (qi-cost kqi))))))
-                            (need-key (or (null enc) forced key-due key-cheaper))
+                            (need-key (or (null enc) resized forced key-due key-cheaper))
                             ;; A KEYFRAME SENT BECAUSE THE SCREEN IS MOVING IS NOT THE SAME FRAME
                             ;; AS ONE SENT BECAUSE THE SESSION STARTED, and until now they were
                             ;; coded identically.  KEY-QI is chosen for the FIRST PICTURE — the
@@ -577,6 +891,9 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             (mkstale (if (> mkqi qi) 1 0))
                             (frame
                               (cond
+                                ;; the resolution just changed: whatever is in hand is the wrong
+                                ;; size, and so is anything the idle branch would have refined
+                                (switched nil)
                                 ;; a keyframe is owed and the desktop is idle: re-encode one from
                                 ;; the last source we saw, so a late receiver can start decoding
                                 ((and (null y) source enc (vp8::ve-have-ref enc)
@@ -646,7 +963,23 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                                                      (max stale-qi eqi) stale-qi)))
                                                 (when nmb (ps-note st-mbs nmb))
                                                 f))))
-                                         ((and st (position 1 st)
+                                         ;; NOT WHILE THE PICTURE IS THE WRONG SIZE.  At a reduced
+                                         ;; resolution a quiet screen is on its way back to full
+                                         ;; (see the restore rule), and every byte spent sharpening
+                                         ;; the small picture is a byte spent on pixels the
+                                         ;; restoring keyframe is about to overwrite — and spent
+                                         ;; ahead of it, so it delays the thing it wastes itself
+                                         ;; on.  Sharpening resumes once the size is settled.
+                                         ;; SC-CODED as well as SC, because between asking for a
+                                         ;; size and holding a picture at it there are passes
+                                         ;; where the two disagree — and in exactly those passes
+                                         ;; the encoder still holds the OLD size, so this would
+                                         ;; sharpen the picture that is being replaced.  Measured
+                                         ;; on the session-start climb at 40 kbps: 15 KB, three
+                                         ;; seconds of link, spent making a half-size picture
+                                         ;; pretty immediately before a full-size keyframe
+                                         ;; overwrote all of it.
+                                         ((and (= sc 1) (= sc-coded 1) st (position 1 st)
                                                (> (/ (* 1000d0 (- (get-internal-real-time)
                                                                   idle-since))
                                                      internal-time-units-per-second)
@@ -807,6 +1140,40 @@ sleep, which is what keeps the capture clock independent of the link rate."
                        ;; whatever the branch above did with them, the captured screen has now
                        ;; been coded (or was not needed): start accumulating again
                        (setf cap-y nil cap-u nil cap-v nil cap-dirty nil cap-scan nil)
+                       ;; publish the resolution the source should hand us next.  The source reads
+                       ;; it when it next produces a frame, so the switch costs one poll, not a
+                       ;; restart — the same shape as *VIDEO-PROFILE*.
+                       (setf *video-scale* sc)
+                       ;; HAS THE SEARCH LOST THE PICTURE?  Counted from KEY-CHEAPER — the rule
+                       ;; that actually turns a moving screen into a keyframe — because that is
+                       ;; the thing we need to escape, and it has two halves: no usable vector at
+                       ;; all, and a vector that accounts for too little to be worth an inter
+                       ;; frame.  A test written on the vector count alone sees only the first.
+                       ;; Measured with such a test: sixteen consecutive 6 KB keyframes at half
+                       ;; resolution, not one of them counted, because the vector was carrying a
+                       ;; fifth of the screen — not enough to avoid the keyframe, quite enough to
+                       ;; look like the search was working.
+                       ;;
+                       ;; Here rather than in the decision above because KEY-CHEAPER is not known
+                       ;; until the frame has been priced.  The policy therefore reads a count of
+                       ;; what already happened, which is the right tense for it.  Reset once the
+                       ;; screen has been still a moment: that episode is over.
+                       (unless switched
+                         (cond ((null y)
+                                (when (> (/ (float (- (get-internal-real-time) idle-since))
+                                            internal-time-units-per-second)
+                                         1d0)
+                                  (setf lost-run 0)))
+                               (resized)
+                               (key-cheaper (incf lost-run))
+                               (t (setf lost-run 0))))
+                       (when (and switched log)
+                         (funcall log (format nil "resolution 1/~a — ~a (~a of ~a mbs new, ~a moved)"
+                                              sc (cond ((and climbing y) "first picture, fast")
+                                                       (climbing "climbing")
+                                                       (y "damage is global")
+                                                       (t "screen is settled"))
+                                              nnew mbs nmv)))
                        ;; carry the frame-rate plan out to the report.  FPS-CAP is the number
                        ;; worth watching: when the cadence we asked for is above it, the rung is
                        ;; not short of BITS, it is short of macroblocks to spend them on, and no
@@ -814,6 +1181,7 @@ sleep, which is what keeps the capture clock independent of the link rate."
                        (setf fps-want feff fps-cap fcap frame-budget budget)
                        (if frame
                            (progn
+                             (setf sc-coded sc)
                              (enqueue frame seq-ts)
                              (incf sent) (incf bytes (length frame))
                              (ps-note st-kb (/ (length frame) 1024d0))
@@ -847,6 +1215,11 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       ;; this rate and resolution, and the frame size they imply
                                       :target-fps fps-want :fps-cap fps-cap
                                       :frame-budget frame-budget
+                                      ;; the resolution divisor now in force, and how often it has
+                                      ;; moved: a rung that thrashes here is a rung whose
+                                      ;; hysteresis is wrong, and it is invisible in every other
+                                      ;; number the sender reports
+                                      :scale sc :scale-drops scale-drops :scale-ups scale-ups
                                       :qi cur-qi :qi-bias qi-bias
                                       :bytes-per-mb (* bpu (qi-cost cur-qi))
                                       :moved-mb (list (ps-min st-mv) (/ (ps-total st-mv) (max 1 (ps-n st-mv))) (ps-max st-mv))
@@ -854,13 +1227,14 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       :pending (if pending (count 1 pending) 0)
                                       :cleanups cleanups)))
                      (when (and log (> dt 5000))
-                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | cleans ~a"
+                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | cleans ~a"
                                             (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
                                             (ps-line st-send) (ps-line st-kb) (ps-line st-mbs)
                                             (ps-line st-mv)
                                             sent skipped takes (/ bytes 1.024 dt)
                                             (/ (* 1000d0 sent) dt)
                                             fps-want fps-cap (/ (* 1000d0 takes) dt) frame-budget
+                                            sc scale-drops scale-ups
                                             cur-qi (and (plusp qi-bias) qi-bias)
                                             (* bpu (qi-cost cur-qi)) mpu
                                             (if pending (count 1 pending) 0) cleanups))

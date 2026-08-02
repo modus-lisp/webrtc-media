@@ -29,4 +29,6 @@
    ;; session glue (webrtc-media/rtc)
    #:start-audio #:start-video #:vp8-packetize
    ;; live quality switching: set this and a RUNNING sender adopts it (see vp8-rtp.lisp)
-   #:*video-profile* #:*force-keyframe*))
+   #:*video-profile* #:*force-keyframe*
+   ;; resolution follows damage: the sender picks a divisor, the frame source honours it
+   #:*video-scale* #:video-scale))
