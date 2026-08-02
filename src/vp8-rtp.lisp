@@ -137,11 +137,67 @@ still pays its skip flags, so emitting one is pure loss."
   (max 8 (floor (max 0 (- bytes overhead)) (max 0.5d0 (* bpu (qi-step-cost q from))))))
 
 (defparameter *frame-coverage-x* 4
-  "How far over the steady-state per-frame budget a single frame may go when the payoff is
-covering the WHOLE change instead of part of it.  The rung's MAX-FRAME-KB is 1.5 s of link time,
-so this is a uniform ceiling of ~6 s in flight at every rung — the same bound the per-frame cap
-was there to give, spent on coverage rather than on sharpness.  Only past this does anything
-defer.")
+  "The LATENCY ceiling on one frame, as a multiple of the rung's MAX-FRAME-KB (1.5 s of link time)
+— ~6 s in flight at every rung.  Only past this does anything defer.
+
+This used to be the ceiling every frame was fitted to, and that is what made the picture stand
+still.  A ceiling stated in SECONDS OF LINK gives one frame every few seconds at EVERY rung: raise
+the rate and the same cadence buys a bigger, sharper frame, which is exactly the complaint that
+320 kbps looks like 40 kbps with better letters.  A live frame is now sized from a FRAME RATE (see
+MOTION-FRAME-BUDGET) and this stays as two things only: the ceiling for frames with nothing
+waiting behind them — a refinement, a deferred-macroblock drain, both of which run while the
+screen is idle — and the backstop a live frame is allowed when its change cannot be covered inside
+the frame-rate budget at any quantizer (see FIT-FRAME).")
+
+(defparameter *frame-overhead-x* 3
+  "The smallest a per-frame budget may be, as a multiple of the frame's FIXED overhead.
+
+Every inter frame spends a skip flag per macroblock whether it codes anything or not: 64 bytes of
+header plus one bit per macroblock, ~564 bytes at 1280x800.  Asking for a frame rate whose budget
+approaches that does not buy motion, it buys flags — at 40 kbps, ten frames a second would be 500
+byte frames of which 96% is the flags and nothing is left for a picture.  So the requested rate is
+clamped to what the overhead permits (FRAME-FPS-CAP) and the clamp is REPORTED, because a rung
+sitting on it is a rung where the RESOLUTION, not the bitrate, is what stands between the viewer
+and fluid motion.")
+
+(defun frame-fps-cap (bytes-per-sec overhead)
+  "The most frames per second BYTES-PER-SEC can carry at this resolution before the skip flags are
+more than 1/*FRAME-OVERHEAD-X* of every frame.  A property of the RATE and the RESOLUTION and
+nothing else — no content, no quantizer — which is why it is the honest ceiling to quote: at
+1280x800 it is ~1.5 fps at 20 kbps, ~3 at 40, ~6 at 80, ~12 at 160 and ~24 at 320."
+  (if (plusp overhead)
+      (/ (float bytes-per-sec 1d0) (* *frame-overhead-x* (float overhead 1d0)))
+      60d0))
+
+(defun motion-frame-budget (bytes-per-sec target-fps overhead)
+  "The bytes a LIVE frame is allowed: a second of the link divided by the frame rate we are trying
+to hold, rather than a fixed slice of link time.  Returns (values budget effective-fps cap).
+
+THIS IS THE RATE/MOTION TRADE, and it is the whole point of the number.  Sized in link-seconds, a
+frame is the same NUMBER OF SECONDS at every rung, so more bitrate is spent entirely on making
+that one frame sharper and the screen updates just as rarely at 320 kbps as at 40.  Sized from a
+frame rate, the extra bytes go into extra FRAMES, and how sharp a frame of that size can be is
+left where it belongs — with the quantizer fit, which is unchanged and still covers the whole
+change rather than part of it."
+  (let* ((cap (frame-fps-cap bytes-per-sec overhead))
+         (eff (max 0.1d0 (min (float (or target-fps 10) 1d0) cap))))
+    (values (max 256 (floor bytes-per-sec eff)) eff cap)))
+
+(defun fit-frame (n bpu overhead qi max-qi budget ceiling)
+  "Fit N macroblocks into BUDGET if they can be covered there, and into CEILING if they cannot.
+Returns (values quantizer allowed-bytes fits-p).
+
+THE BUDGET IS A TARGET AND COVERAGE IS A CONSTRAINT, in that order.  BUDGET is the size that holds
+the frame rate; when even MAX-QI overruns it the answer is NOT to code a slice and defer the rest
+— that is the half-current, half-stale patchwork this sender spent two changes getting rid of — it
+is to code the whole change at the coarsest quantizer allowed and spend up to CEILING, the latency
+bound.  So motion is bought where motion is cheap, which is where it actually lives: a scroll or a
+drag is mostly translation, its frames are small, and it gets many of them.  A change that is
+genuinely new content still arrives whole, in one slow frame, exactly as it did before."
+  (multiple-value-bind (q ok) (fit-quantizer n budget bpu overhead qi max-qi)
+    (if ok
+        (values q budget t)
+        (values q ceiling (<= (* n bpu (qi-cost q)) (max 0 (- ceiling overhead)))))))
 
 ;;; ---- switching quality under a running sender ------------------------------
 ;;; Every knob START-VIDEO takes is consulted on each pass of the encode loop, not baked into the
@@ -182,7 +238,7 @@ SEQ is the starting sequence number; returns (values packets next-seq)."
 (defun start-video (agent session ctx &key (pt 96) (width 64) (height 64) (fps 5)
                                            (ssrc #x5e5e0001) (qi 12) (key-secs 30.0) (poll-secs 0.010)
                                            (max-qi 44) (target-kbs 150) (cleanup-ms 700)
-                                           (max-frame-kb 32) (capture-secs 0.040)
+                                           (max-frame-kb 32) (capture-secs 0.040) (target-fps 10)
                                            key-qi source log on-stats sink)
   "Stream VP8 to the peer over SRTP.  CTX is the SRTP context (shared with audio — same DTLS keys,
 different SSRC).  SOURCE, when given, is a thunk returning (values Y U V w h dirty) for the next
@@ -215,6 +271,16 @@ instead of the budget being spent on as many macroblocks as fit at a fixed quali
 remainder deferred.  So a change arrives coarse and COMPLETE, and gets sharper while the screen
 is quiet.  Deferral is still there, but only for the case the quantizer ladder cannot cover: the
 whole screen changed and even MAX-QI overruns *FRAME-COVERAGE-X* frames' worth of budget.
+
+AND THE BUDGET IS A FRAME RATE, which is what decides whether more bitrate buys MOTION or only
+SHARPNESS.  TARGET-FPS is the cadence we are trying to hold; a live frame gets a second of the
+link divided by it (MOTION-FRAME-BUDGET), so at 320 kbps a frame is a few kilobytes and there are
+several a second, where a budget stated in link-seconds gave one big sharp frame every couple of
+seconds at every rung alike.  The rate is CLAMPED by what the per-macroblock skip flags permit —
+below that clamp a frame is mostly flags and no picture — and both the request and the clamp are
+reported, so a rung sitting on its ceiling is visible as such.  Frames with nothing waiting behind
+them (refinement, deferred drain) keep the old link-time ceiling: they are idle-time work, and
+shrinking them buys nobody anything.
 
 Quality adapts to the link: QI is the best (sharpest) quantizer, MAX-QI the worst we will fall
 back to, and TARGET-KBS the rate the pacer emits at.  The quantizer controller is driven by the
@@ -318,6 +384,10 @@ sleep, which is what keeps the capture clock independent of the link rate."
                ;;        NOT normalised to a quantizer, because it does not have one — this is the
                ;;        one term in the model that a coarser frame does not make cheaper.
                (bpu 35d0) (rpu 17.5d0) (kpu 17.5d0) (mpu 1.0d0)
+               ;; the frame-rate plan the last pass computed, kept out here only so the periodic
+               ;; report can quote it: what we asked for, what the skip flags allow, and the byte
+               ;; size those two produce
+               (fps-want 0d0) (fps-cap 0d0) (frame-budget 0)
                (cur-qi qi) (qi-bias 0) (stale-qi qi)
                ;; RESYNC ON A WALL CLOCK, not on source activity, and at a RATE-SCALED interval.
                ;; A keyframe is ~22 KB whatever we do to it, so at 40 kbps a 3 s resync is 16 s of
@@ -343,13 +413,14 @@ sleep, which is what keeps the capture clock independent of the link rate."
                        cleanup-ms   (or (getf p :cleanup-ms) cleanup-ms)
                        key-qi       (or (getf p :key-qi) key-qi)
                        key-secs     (or (getf p :key-secs) key-secs)
+                       target-fps   (or (getf p :target-fps) target-fps)
                        cur-qi       (min (max cur-qi qi) max-qi))
                  (unless (equal p *video-profile-applied*)
                    (setf *video-profile-applied* p)
                    (when log
-                     (funcall log (format nil "profile ~@[~a ~]applied live: qi ~a/~a key-qi ~a target ~,2f KB/s frame<=~,1f KB cleanup ~a ms resync ~,0f s"
+                     (funcall log (format nil "profile ~@[~a ~]applied live: qi ~a/~a key-qi ~a target ~,2f KB/s ~,1f fps frame<=~,1f KB cleanup ~a ms resync ~,0f s"
                                           (getf p :name) qi max-qi (or key-qi qi) target-kbs
-                                          max-frame-kb cleanup-ms key-secs))))))
+                                          target-fps max-frame-kb cleanup-ms key-secs))))))
              (handler-case
                  (progn
                    ;; ---- 1. LOOK AT THE DESKTOP, on the capture clock ----------------------
@@ -394,8 +465,19 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             (mbs (if enc (* (vp8::ve-mb-cols enc) (vp8::ve-mb-rows enc)) 0))
                             ;; the skip flag every macroblock pays whether it codes or not
                             (overhead (+ 64 (floor mbs 8)))
-                            (budget (floor (* max-frame-kb 1024)))
-                            (ceiling-bytes (* *frame-coverage-x* budget))
+                            ;; the LATENCY ceiling, in seconds of link — what a frame with nothing
+                            ;; waiting behind it may cost, and the backstop for one that cannot be
+                            ;; covered inside the frame-rate budget below
+                            (link-budget (floor (* max-frame-kb 1024)))
+                            (link-ceiling (* *frame-coverage-x* link-budget))
+                            ;; THE FRAME-RATE BUDGET: a second of the link divided by the cadence
+                            ;; we are trying to hold, clamped to what the skip flags leave room
+                            ;; for.  This is the number that decides whether the next rung up buys
+                            ;; more pictures or just a better one.
+                            (bps (* target-kbs 1024))
+                            (plan (multiple-value-list
+                                   (motion-frame-budget bps target-fps overhead)))
+                            (budget (first plan)) (feff (second plan)) (fcap (third plan))
                             ;; what this frame is being asked to cover, and the finest quantizer
                             ;; that covers ALL of it inside the ceiling
                             (want (cond ((null pending) dirty)
@@ -418,8 +500,23 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             ;; off the top, exactly like the skip flags do.
                             (mv-bytes (* nmv mpu))
                             (live-overhead (+ overhead mv-bytes))
-                            (fq (fit-quantizer nnew ceiling-bytes bpu live-overhead qi max-qi))
-                            (fits (<= (* nnew bpu (qi-cost fq)) (- ceiling-bytes live-overhead)))
+                            ;; A BUDGET MAY NOT REFUSE THE MOTION ITSELF.  The frame's unavoidable
+                            ;; cost is its skip flags plus a mode and a vector reference for every
+                            ;; macroblock that merely moved, and none of that gets cheaper at a
+                            ;; coarser quantizer.  A budget under it would leave FIT-QUANTIZER no
+                            ;; room at all and defer the whole change — deferring the very thing
+                            ;; the frame exists to carry.  So the frame always gets what it cannot
+                            ;; avoid plus half a budget to code with, and the frame rate that
+                            ;; implies is the honest one for this much screen in motion.
+                            (mo-ceiling (min link-ceiling
+                                             (max budget
+                                                  (+ (ceiling live-overhead) (floor budget 2)))))
+                            (fit (multiple-value-list
+                                  (fit-frame nnew bpu live-overhead qi max-qi
+                                             mo-ceiling link-ceiling)))
+                            (fq (first fit))
+                            (ceiling-bytes (second fit))
+                            (fits (third fit))
                             (useq (max qi (min max-qi (+ fq qi-bias))))
                             ;; WHEN THE WHOLE SCREEN CHANGED, A KEYFRAME IS THE CHEAP WAY TO
                             ;; COVER IT.  An inter macroblock cannot use intra prediction, so
@@ -434,10 +531,50 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             ;; estimate prices the two populations separately (see the model at
                             ;; the top of this file) and a translation can no longer talk itself
                             ;; into a keyframe just by being large.
+                            ;;
+                            ;; AND THE FIRST TEST IS STRUCTURAL, NOT AN ESTIMATE.  When the whole
+                            ;; screen changed and almost none of it translated, the inter frame
+                            ;; must re-code every macroblock with no intra prediction to help it —
+                            ;; that is the case a keyframe wins BY CONSTRUCTION, and it needs no
+                            ;; arithmetic.  Which is just as well, because BPU is the one number
+                            ;; that cannot be trusted here: it is learned from live frames, and a
+                            ;; drag's frames are almost all translation with a thin residual, so a
+                            ;; few seconds of dragging teaches it that a macroblock costs about
+                            ;; nothing.  Apply that to a screenful of genuinely new content and the
+                            ;; estimate comes out under a keyframe's when the frame is really twice
+                            ;; it — measured at 320 kbps: a 177 KB inter frame, 4.5 s of link, in
+                            ;; place of a 105 KB keyframe that was sharper.
                             (key-cheaper (and enc y (> nwant (* 0.8 mbs))
-                                              (> (+ mv-bytes (* nnew bpu (qi-cost useq)))
-                                                 (* mbs kpu (qi-cost kqi)))))
+                                              (or (< nmv (floor nwant 4))
+                                                  (> (+ mv-bytes (* nnew bpu (qi-cost useq)))
+                                                     (* mbs kpu (qi-cost kqi))))))
                             (need-key (or (null enc) forced key-due key-cheaper))
+                            ;; A KEYFRAME SENT BECAUSE THE SCREEN IS MOVING IS NOT THE SAME FRAME
+                            ;; AS ONE SENT BECAUSE THE SESSION STARTED, and until now they were
+                            ;; coded identically.  KEY-QI is chosen for the FIRST PICTURE — the
+                            ;; sharpest that lands in a couple of seconds — which is right for a
+                            ;; frame the viewer will hold while it reads.  A keyframe sent because
+                            ;; the screen is SCROLLING is held for one frame time and then
+                            ;; replaced, so its budget is the frame rate's, not the first
+                            ;; picture's: at 320 kbps that is 22 KB at qi 127, 0.55 s of link,
+                            ;; instead of 105 KB at qi 44 and 2.7 s.
+                            ;;
+                            ;; This is the frame the fps budget could not otherwise reach, and on
+                            ;; a full-screen scroll it is the ONLY frame there is.  A scroll that
+                            ;; outruns the motion search (the displacement between two frames is
+                            ;; past the format's +-255) has no vector, so every frame of it is a
+                            ;; whole-screen recode priced as a keyframe — and a keyframe sized for
+                            ;; a first picture is what pinned that scroll to one frame every three
+                            ;; seconds however much bandwidth it was given.  Coarse and moving,
+                            ;; then sharp when it stops: the trade the rest of this sender already
+                            ;; makes, applied to the one frame still exempt from it.  A RESYNC
+                            ;; keyframe is not this frame and keeps KEY-QI — it exists precisely
+                            ;; for a viewer that has nothing, and handing it the coarsest picture
+                            ;; the format has would be answering the wrong question.
+                            (mkqi (if (and enc key-cheaper (not forced) (not key-due))
+                                      (fit-quantizer mbs budget kpu overhead kqi 127)
+                                      kqi))
+                            (mkstale (if (> mkqi qi) 1 0))
                             (frame
                               (cond
                                 ;; a keyframe is owed and the desktop is idle: re-encode one from
@@ -482,10 +619,15 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                      ;;      finer, once the screen has been quiet a moment.
                                      (let ((st (and enc (vp8::ve-stale-mbs enc))))
                                        (cond
+                                         ;; NOTE the ceiling: both jobs below run while the desktop
+                                         ;; is IDLE, so nothing is waiting behind them and there is
+                                         ;; no motion for a smaller frame to buy.  They keep the
+                                         ;; link-time ceiling; only LIVE frames are sized from the
+                                         ;; frame rate.
                                          ((and enc pending (position 1 pending))
                                           (let* ((ns (count 1 pending)))
                                             (multiple-value-bind (dq fits)
-                                                (fit-quantizer ns ceiling-bytes bpu overhead
+                                                (fit-quantizer ns link-ceiling bpu overhead
                                                                qi max-qi)
                                               (multiple-value-bind (f nmb defer mv eqi)
                                                   (with-timing (st-enc)
@@ -494,7 +636,7 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                                      (vp8::ve-prev-v enc)
                                                      :qi dq :dirty pending :force t :clean-qi qi
                                                      :max-mbs (unless fits
-                                                                (mbs-fitting ceiling-bytes bpu
+                                                                (mbs-fitting link-ceiling bpu
                                                                              overhead dq))))
                                                 (declare (ignore mv))
                                                 (setf pending defer)
@@ -531,12 +673,12 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                                  ;; never sent at all, and costs full price
                                                  (from (and (> stale-qi qi) stale-qi)))
                                             (multiple-value-bind (rq rfits)
-                                                (fit-quantizer ns (floor ceiling-bytes 2) rpu
+                                                (fit-quantizer ns (floor link-ceiling 2) rpu
                                                                overhead qi max-qi from)
                                               (let* ((whole (and rfits (<= rq (- stale-qi 2))))
                                                      (useq (if whole rq qi))
                                                      (cap (unless whole
-                                                            (mbs-fitting budget rpu overhead
+                                                            (mbs-fitting link-budget rpu overhead
                                                                          qi from))))
                                                 (setf cur-qi useq)
                                                 (when whole (setf stale-qi rq))
@@ -567,12 +709,14 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                  ;; session that started while the desktop was busy measured its
                                  ;; resync age from time zero and considered a keyframe overdue
                                  ;; for ever after.
+                                 ;; MKQI, not KQI: a keyframe the CONTENT asked for is sized by the
+                                 ;; frame rate, a resync or a first picture by KEY-QI.  See MKQI.
                                  (setf last-key (get-internal-real-time) pending nil
-                                       cur-qi kqi stale-qi (if (plusp kstale) kqi qi))
+                                       cur-qi mkqi stale-qi (if (plusp mkstale) mkqi qi))
                                  (setf enc (vp8::make-encoder w h))
                                  (multiple-value-bind (f ry ru rv)
                                      (with-timing (st-enc)
-                                       (vp8:encode-gray-frame y w h :qi kqi :u u :v v))
+                                       (vp8:encode-gray-frame y w h :qi mkqi :u u :v v))
                                    (setf (vp8::ve-ref-y enc) ry (vp8::ve-ref-u enc) ru
                                          (vp8::ve-ref-v enc) rv)
                                    (replace (vp8::ve-prev-y enc) y)
@@ -582,10 +726,10 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                          (vp8::ve-stale-mbs enc)
                                          (make-array (* (vp8::ve-mb-cols enc)
                                                         (vp8::ve-mb-rows enc))
-                                                     :element-type 'bit :initial-element kstale))
+                                                     :element-type 'bit :initial-element mkstale))
                                    (let ((kn (* (vp8::ve-mb-cols enc) (vp8::ve-mb-rows enc))))
                                        (when (plusp kn)
-                                         (setf kpu (/ (length f) kn (qi-cost kqi)))))
+                                         (setf kpu (/ (length f) kn (qi-cost mkqi)))))
                                    f))
                                 ;; otherwise an inter frame, and this is the whole point: pick the
                                 ;; quantizer the CHANGE fits in, and code all of it.
@@ -663,6 +807,11 @@ sleep, which is what keeps the capture clock independent of the link rate."
                        ;; whatever the branch above did with them, the captured screen has now
                        ;; been coded (or was not needed): start accumulating again
                        (setf cap-y nil cap-u nil cap-v nil cap-dirty nil cap-scan nil)
+                       ;; carry the frame-rate plan out to the report.  FPS-CAP is the number
+                       ;; worth watching: when the cadence we asked for is above it, the rung is
+                       ;; not short of BITS, it is short of macroblocks to spend them on, and no
+                       ;; amount of bitrate will make the picture move any faster at this size.
+                       (setf fps-want feff fps-cap fcap frame-budget budget)
                        (if frame
                            (progn
                              (enqueue frame seq-ts)
@@ -694,6 +843,10 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       :sent sent :idle skipped :captured takes
                                       :kbs (/ bytes 1.024 dt) :fps (/ (* 1000d0 sent) dt)
                                       :capture-fps (/ (* 1000d0 takes) dt)
+                                      ;; the cadence asked for, the one the skip flags allow at
+                                      ;; this rate and resolution, and the frame size they imply
+                                      :target-fps fps-want :fps-cap fps-cap
+                                      :frame-budget frame-budget
                                       :qi cur-qi :qi-bias qi-bias
                                       :bytes-per-mb (* bpu (qi-cost cur-qi))
                                       :moved-mb (list (ps-min st-mv) (/ (ps-total st-mv) (max 1 (ps-n st-mv))) (ps-max st-mv))
@@ -701,12 +854,13 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       :pending (if pending (count 1 pending) 0)
                                       :cleanups cleanups)))
                      (when (and log (> dt 5000))
-                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (cap ~,1f) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | cleans ~a"
+                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | cleans ~a"
                                             (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
                                             (ps-line st-send) (ps-line st-kb) (ps-line st-mbs)
                                             (ps-line st-mv)
                                             sent skipped takes (/ bytes 1.024 dt)
-                                            (/ (* 1000d0 sent) dt) (/ (* 1000d0 takes) dt)
+                                            (/ (* 1000d0 sent) dt)
+                                            fps-want fps-cap (/ (* 1000d0 takes) dt) frame-budget
                                             cur-qi (and (plusp qi-bias) qi-bias)
                                             (* bpu (qi-cost cur-qi)) mpu
                                             (if pending (count 1 pending) 0) cleanups))
