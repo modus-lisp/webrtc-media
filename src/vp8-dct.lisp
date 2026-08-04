@@ -7,16 +7,45 @@
 
 (in-package #:webrtc-media.vp8)
 
-(deftype blk () '(simple-array (signed-byte 32) (16)))
-(defun mkblk (&optional (init 0)) (make-array 16 :element-type '(signed-byte 32) :initial-element init))
+;;; A COEFFICIENT BLOCK IS SIXTEEN BITS, and the bound is proved rather than observed — the whole
+;;; chain is worst-case, independent of the picture:
+;;;
+;;;   residual   = source - prediction, both 8-bit          -> [-255, 255]
+;;;   fdct TMP   = 8*(sum of two residuals) + 8*(two more)  -> |x| <= 8160
+;;;   fdct OUT   = (a1+b1+7) >> 4 with |a1|,|b1| <= 16320   -> |x| <= 2040
+;;;   fwht IN    = the sixteen fdct DCs                     -> |x| <= 2040
+;;;   fwht TMP   = 4*(in+in) + 4*(in+in) + 1                -> |x| <= 32641
+;;;   fwht OUT   = ((a1+b1)+(d1+c1)+3) >> 3                 -> |x| <= 16320
+;;;   levels     = clamped to DCT_MAX_VALUE                 -> |x| <= 2047
+;;;   dequantized = level * q, and the clamp only ever LOWERS it below the coefficient it came from
+;;;                                                         -> |x| <= 16400
+;;;
+;;; So every STORED value fits, and measured over real desktop frames at qi 8/24/52/127 the largest
+;;; any of them actually reached was fwht TMP at 32641 — exactly its bound.
+;;;
+;;; THAT ONE HAS 126 COUNTS OF HEADROOM, which is worth knowing before anything here is changed.
+;;; It is safe only because the residual is 8-bit; a deeper input, or a different rounding in the
+;;; forward DCT, would silently wrap it.  And the WHT's pass-2 INTERMEDIATES (a2..d2, which are
+;;; Lisp locals and so stay full-width here) reach +-128068 — eighteen bits.  A vectorised WHT
+;;; therefore cannot stay in 16-bit lanes across pass 2, whatever the arrays say; the DCT can,
+;;; with a factor of four to spare.
+(deftype blk () '(simple-array (signed-byte 16) (16)))
+
+;; INLINE, and that is not cosmetic.  Each transform below allocates its own TMP and declares it
+;; DYNAMIC-EXTENT — but a DYNAMIC-EXTENT binding can only be stack-allocated when the compiler can
+;; SEE the allocation, and behind an out-of-line call it cannot.  So every one of the ~200000
+;; transform calls in a keyframe was heap-allocating a 16-element block: 16 MB of garbage per
+;; frame, for arrays that never outlive the call that makes them.
+(declaim (inline mkblk))
+(defun mkblk (&optional (init 0)) (make-array 16 :element-type '(signed-byte 16) :initial-element init))
 
 ;;; ---- forward DCT (vp8_short_fdct4x4_c) -------------------------------------
 (defun fdct4x4 (in out)
   "Forward VP8 4x4 DCT.  IN 16 residual samples (row-major), OUT 16 coefficients."
-  (declare (type (simple-array (signed-byte 32) (16)) in out)
+  (declare (type (simple-array (signed-byte 16) (16)) in out)
            (optimize (speed 3) (safety 0)))
   (let ((tmp (mkblk)))
-    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 32) (16)) tmp))
+    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 16) (16)) tmp))
     (dotimes (i 4)                                     ; pass 1: rows
       (let* ((o (* i 4))
              (a1 (* 8 (+ (aref in (+ o 0)) (aref in (+ o 3)))))
@@ -42,10 +71,10 @@
 (defconstant +c1const+ 20091)   ; cospi8sqrt2minus1
 (defconstant +c2const+ 35468)   ; sinpi8sqrt2
 (defun idct4x4 (in out)
-  (declare (type (simple-array (signed-byte 32) (16)) in out)
+  (declare (type (simple-array (signed-byte 16) (16)) in out)
            (optimize (speed 3) (safety 0)))
   (let ((tmp (mkblk)))
-    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 32) (16)) tmp))
+    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 16) (16)) tmp))
     (dotimes (i 4)                                     ; columns
       (let* ((i0 (aref in i)) (i4 (aref in (+ i 4))) (i8 (aref in (+ i 8))) (i12 (aref in (+ i 12)))
              (a1 (+ i0 i8)) (b1 (- i0 i8))
@@ -66,10 +95,10 @@
 ;;; ---- forward / inverse Walsh-Hadamard (Y2) --------------------------------
 (defun fwht4x4 (in out)
   "Forward VP8 Walsh-Hadamard of the 16 luma DC values (vp8_short_walsh4x4_c)."
-  (declare (type (simple-array (signed-byte 32) (16)) in out)
+  (declare (type (simple-array (signed-byte 16) (16)) in out)
            (optimize (speed 3) (safety 0)))
   (let ((tmp (mkblk)))
-    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 32) (16)) tmp))
+    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 16) (16)) tmp))
     (dotimes (i 4)
       (let* ((o (* i 4))
              (a1 (* 4 (+ (aref in (+ o 0)) (aref in (+ o 2)))))
@@ -92,10 +121,10 @@
     out))
 
 (defun iwht4x4 (in out)
-  (declare (type (simple-array (signed-byte 32) (16)) in out)
+  (declare (type (simple-array (signed-byte 16) (16)) in out)
            (optimize (speed 3) (safety 0)))
   (let ((tmp (mkblk)))
-    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 32) (16)) tmp))
+    (declare (dynamic-extent tmp) (type (simple-array (signed-byte 16) (16)) tmp))
     (dotimes (i 4)
       (let* ((a1 (+ (aref in (+ i 0)) (aref in (+ i 12)))) (b1 (+ (aref in (+ i 4)) (aref in (+ i 8))))
              (c1 (- (aref in (+ i 4)) (aref in (+ i 8)))) (d1 (- (aref in (+ i 0)) (aref in (+ i 12)))))
@@ -121,9 +150,13 @@
     78 80 82 84 86 88 90 92 94 96 98 100 102 104 106 108 110 112 114 116 119 122 125 128 131 134 137 140 143 146 149 152
     155 158 161 164 167 170 173 177 181 185 189 193 197 201 205 209 213 217 221 225 229 234 239 245 249 254 259 264 269 274 279 284))
 
+;; The four quantizers multiply every dequantized coefficient in the frame.  They are read from
+;; untyped tables once per frame, so what matters is not the tables but that the VALUE carries its
+;; range to the callers — untyped, each of those multiplies compiled to a GENERIC-*.
+(declaim (ftype (function (t) (integer 1 4096)) dc-quant ac-quant y2-dc-quant y2-ac-quant))
 (defun qclamp (q) (max 0 (min 127 q)))
-(defun dc-quant (qi) (aref +dc-qlookup+ (qclamp qi)))
-(defun ac-quant (qi) (aref +ac-qlookup+ (qclamp qi)))
+(defun dc-quant (qi) (the (integer 1 4096) (aref +dc-qlookup+ (qclamp qi))))
+(defun ac-quant (qi) (the (integer 1 4096) (aref +ac-qlookup+ (qclamp qi))))
 ;; Second-order (Y2) quantizers, libvpx common/quant_common.c vp8_dc2quant / vp8_ac2quant.
 ;; The AC one is ac_qlookup*155/100 done as an exact integer op — (x*101581)>>16 — with a
 ;; floor of 8; rounding it as 155*x/100 to nearest disagrees at several quantizer indices

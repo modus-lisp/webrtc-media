@@ -792,8 +792,8 @@ answer here means the encoder would have found nothing either."
                           blk co q dq rec)
   "Residual-code one plane region against PRED (a SIZE x SIZE prediction buffer), writing the
 reconstruction into CUR.  Returns T if anything was coded."
-  (declare (type (simple-array (unsigned-byte 8) (*)) src pred cur)
-           (type (simple-array (signed-byte 32) (16)) blk co q dq rec)
+  (declare (type (simple-array (unsigned-byte 8) (*)) src pred cur above left)
+           (type (simple-array (signed-byte 16) (16)) blk co q dq rec)
            (type fixnum sw sh rw ox oy size ai0 li0)
            (type (integer 1 4096) dcq acq)
            (optimize (speed 3) (safety 0)))
@@ -841,7 +841,7 @@ sharpness of wherever it came from and the idle pass still knows to come back fo
   "How many bytes of this frame are already written, near enough to bound it by.  The two
 partitions' buffers plus the three-byte tag and the two flushes the assembly below adds."
   (declare (optimize (speed 3) (safety 0)))
-  (+ 11 (fill-pointer (bw-buf bw)) (fill-pointer (bw-buf tw))))
+  (+ 11 (bw-fill bw) (bw-fill tw)))
 
 (defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12) max-mbs max-bytes
                                           motion)
@@ -915,7 +915,7 @@ caller learning what a translation costs learns it from the count that actually 
          ;; macroblock, which at 4000 macroblocks is ~120k allocations (and the GC churn) a frame
          (cblk (mkblk)) (cco (mkblk)) (cq (mkblk)) (cdq (mkblk)) (crec (mkblk))
          (acs (let ((a (make-array 16))) (dotimes (i 16 a) (setf (aref a i) (mkblk)))))
-         (dcs (make-array 16 :element-type '(signed-byte 32)))
+         (dcs (make-array 16 :element-type '(signed-byte 16)))
          (py (make-array 256 :element-type '(unsigned-byte 8)))
          (pu (make-array 64 :element-type '(unsigned-byte 8)))
          (pv (make-array 64 :element-type '(unsigned-byte 8)))
@@ -944,7 +944,10 @@ caller learning what a translation costs learns it from the count that actually 
          (mvr (when use-mv (ms-mv-row ms))) (mvc (when use-mv (ms-mv-col ms)))
          (was-stale (when use-mv (ms-was-stale ms)))
          (was-unsent (when use-mv (ms-was-unsent ms))))
-    (declare (type fixnum gmvx gmvy coded translated)
+    (declare (type fixnum gmvx gmvy coded translated mc mr w h sw sh pw ph cw chh)
+             (type (integer 1 4096) dcq acq y2dcq y2acq uvdcq uvacq)
+             (type (simple-array (signed-byte 16) (16))
+                   blk co y2in y2co y2q dq rec y2dq y2r cblk cco cq cdq crec dcs)
              (type (simple-array (unsigned-byte 8) (*)) cy cu cv)
              (type (simple-array (unsigned-byte 8) (256)) py)
              (type (simple-array (unsigned-byte 8) (64)) pu pv cbuf))
@@ -1201,11 +1204,11 @@ caller learning what a translation costs learns it from the count that actually 
     (replace (ve-prev-y enc) y) (replace (ve-prev-u enc) u) (replace (ve-prev-v enc) v)
     (setf (ve-have-ref enc) t)
     ;; ---- assemble: 3-byte tag only (no start code / dimensions on an inter frame) ----
-    (let* ((p1 (bwrite-finish bw)) (p2 (bwrite-finish tw)) (frame (u8buf))
+    (let* ((p1 (bwrite-finish bw)) (p2 (bwrite-finish tw))
+           (frame (u8buf (+ 8 (length p1) (length p2))))
            (tag (logior 1 (ash 0 1) (ash 1 4) (ash (length p1) 5))))   ; key_frame=1 means NOT key
       (vector-push-extend (logand tag #xff) frame)
       (vector-push-extend (logand (ash tag -8) #xff) frame)
       (vector-push-extend (logand (ash tag -16) #xff) frame)
-      (loop for b across p1 do (vector-push-extend b frame))
-      (loop for b across p2 do (vector-push-extend b frame))
+      (u8append frame p1) (u8append frame p2)
       (values frame coded deferred (when use-mv (cons (- gmvx) (- gmvy))) eqi translated))))

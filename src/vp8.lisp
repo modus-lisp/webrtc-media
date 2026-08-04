@@ -10,7 +10,20 @@
 
 (in-package #:webrtc-media.vp8)
 
-(defun u8buf () (make-array 64 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+(defun u8buf (&optional (capacity 64))
+  (make-array capacity :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+
+(defun u8append (out bytes)
+  "Append BYTES to the adjustable buffer OUT in one copy.  A coded partition is up to 200 KB, and
+appending it a byte at a time is a full call to VECTOR-PUSH-EXTEND — and a reallocation every
+doubling — for each of them."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+  (let ((n (fill-pointer out)) (m (length bytes)))
+    (when (< (array-dimension out 0) (+ n m))
+      (adjust-array out (max (* 2 (array-dimension out 0)) (+ n m))))
+    (setf (fill-pointer out) (+ n m))
+    (replace out bytes :start1 n)
+    out))
 
 (defun write-uncompressed-header (out width height first-part-size &key (version 0) (show t))
   "Append the 10-byte VP8 keyframe uncompressed data chunk to OUT (adjustable u8 vector):
@@ -128,7 +141,13 @@ chroma directly.  Only DC is non-zero, so this is exactly the token coder's simp
 (defun flat-wht-dc (dc)
   "Forward-WHT DC of sixteen identical luma DC values."
   (let ((in (mkblk dc)) (out (mkblk))) (fwht4x4 in out) (aref out 0)))
-(defun quant1 (v q) (if (minusp v) (- (floor (+ (- v) (floor q 2)) q)) (floor (+ v (floor q 2)) q)))
+;; Inline and typed: this is called sixteen times per coded block, and untyped its two FLOORs went
+;; through the generic TRUNCATE — on a keyframe that alone was ~10% of the encode.
+(declaim (inline quant1))
+(defun quant1 (v q)
+  (declare (type (signed-byte 32) v) (type (integer 1 4096) q)
+           (optimize (speed 3) (safety 0)))
+  (if (minusp v) (- (floor (+ (- v) (floor q 2)) q)) (floor (+ v (floor q 2)) q)))
 
 (defun encode-keyframe-checker (width height &key (qi 40) (phase 0) (bright 200))
   "A checkerboard of macroblocks: half left at the DC prediction (mid-gray 128) via mb_skip_coeff,
