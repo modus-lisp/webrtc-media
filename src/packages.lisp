@@ -19,6 +19,9 @@
   (:export
    ;; G.711 codec (re-exported from reed; (signed-byte 16) PCM <-> (unsigned-byte 8) codewords)
    #:pcmu-encode #:pcmu-decode #:pcma-encode #:pcma-decode
+   ;; the audio frame, and where one comes from (a SOURCE thunk; see audio.lisp)
+   #:+audio-frame-samples+ #:*audio-frame-secs* #:audio-frame #:make-audio-frame
+   #:rms-level #:fill-audio-frame #:make-tone-source
    ;; RTP
    #:rtp #:make-rtp #:rtp-pack #:rtp-parse
    #:rtp-pt #:rtp-marker #:rtp-seq #:rtp-timestamp #:rtp-ssrc #:rtp-payload

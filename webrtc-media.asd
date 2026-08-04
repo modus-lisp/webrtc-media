@@ -13,6 +13,7 @@ the same bundled ICE/DTLS transport."
     :serial t
     :components
     ((:file "packages")
+     (:file "audio")       ; the 20 ms / 8 kHz audio frame + the SOURCE thunk that produces one
      (:file "rtp")         ; RTP + RTCP header pack/parse (RFC 3550)
      (:file "srtp")        ; DTLS-SRTP keying (RFC 5764) + SRTP/SRTCP AES-GCM (RFC 7714)
      (:file "vp8-bool")     ; VP8 boolean entropy coder (RFC 6386 §7/§13)
