@@ -199,6 +199,24 @@ genuinely new content still arrives whole, in one slow frame, exactly as it did 
         (values q budget t)
         (values q ceiling (<= (* n bpu (qi-cost q)) (max 0 (- ceiling overhead)))))))
 
+(defparameter *motion-qi-ease* 8
+  "How many quantizer steps a LIVE frame may SHARPEN by, per frame, while the screen is moving.
+
+Coarsening is never rate-limited — the budget binds now, and delaying the response to it is the
+lag this sender spends most of its rules removing.  Sharpening is, and only during motion.  The
+quantizer a live frame is fitted to is a function of how much of the screen changed in it, and
+that number is not smooth: a scroll's frames alternate between ones the motion vector carries
+almost entirely and ones with a band of genuinely new content, so the fit alternates too.  Once
+the motion ceiling is unclamped (see MOTION-QI) the swing is the full ladder rather than the
+15 steps MAX-QI used to allow, and a picture that jumps between 127 and 8 and back while the
+user is still scrolling reads as PUMPING — which is a different complaint from the one being
+fixed, not an improvement on it.
+
+Eight steps is about one 4:3 change in coefficient magnitude per frame, so a frame that comes
+out cheap converges on its quantizer over three or four frames — under a second at any rung
+where motion is fluid at all, and invisible against the refinement pass that follows.  0 turns
+the limit off entirely and restores the raw fit.")
+
 ;;; ---- idle work is not exempt from the frame budget --------------------------
 ;;;
 ;;; Two frames carry nothing the viewer is waiting for: the REFINEMENT pass, which re-codes finer
@@ -468,6 +486,7 @@ SEQ is the starting sequence number; returns (values packets next-seq)."
                                            (ssrc #x5e5e0001) (qi 12) (key-secs 30.0) (poll-secs 0.010)
                                            (max-qi 44) (target-kbs 150) (cleanup-ms 700)
                                            (max-frame-kb 32) (capture-secs 0.040) (target-fps 10)
+                                           (motion-qi 127)
                                            key-qi source log on-stats sink)
   "Stream VP8 to the peer over SRTP.  CTX is the SRTP context (shared with audio — same DTLS keys,
 different SSRC).  SOURCE, when given, is a thunk returning (values Y U V w h dirty) for the next
@@ -519,7 +538,34 @@ build a huge frame.  Both jobs are resumable, so being cut short costs one frame
 (*VIDEO-INPUT-AT*), because input is damage that has not happened yet.
 
 Quality adapts to the link: QI is the best (sharpest) quantizer, MAX-QI the worst we will fall
-back to, and TARGET-KBS the rate the pacer emits at.  The quantizer controller is driven by the
+back to, and TARGET-KBS the rate the pacer emits at.
+
+AND MAX-QI IS THE SETTLING CEILING, NOT THE MOTION ONE — MOTION-QI IS THAT, and separating the
+two is what makes a busy screen cheap at a fast link.  They are different questions wearing one
+name.  MAX-QI bounds THE QUALITY THE PICTURE SETTLES TO: it is where the refinement arc stops,
+so a rung that can afford a sharp still should have a low one.  What a LIVE frame may fall to
+when its budget binds is a different number entirely, and it has to reach 127 — the coarsest
+quantizer the format has — AT EVERY RATE, because a frame that must cover the whole screen
+inside one frame-time's worth of bytes can only do it by being coarse.  With one knob doing
+both, the rungs from 160 kbps up were capped at MAX-QI 52 during motion: no quantizer in
+[QI, 52] ever fit a full-screen scroll, FIT-FRAME's fallback fired on every frame, and each one
+spent up to the LATENCY ceiling instead — 22 KB against a 5 KB budget at 480 kbps, four frames
+of it per ten seconds.  Sharp, and several seconds stale.  The picture only went coarse-and-
+fluid at 5-48 kbps, which is where MAX-QI happened to reach 100-127 on its own.
+
+So MOTION-QI is the ceiling FIT-FRAME searches to and the clamp on the chosen quantizer, and
+nothing else reads it: the refinement pass, the drain and the settled quality are all still
+MAX-QI's, so what the picture converges to when the screen stops is exactly what it was.  It
+defaults to 127 and there is no rate at which it should be lower — coarse frames are the
+cheapest motion there is, and the refinement machinery already sharpens them back.
+
+MOTION-QI-EASE rate-limits ONE DIRECTION of that: a live frame may coarsen as fast as the
+budget demands, but may only SHARPEN by that many quantizer steps per frame while the screen
+is still moving.  Unclamping the ceiling means a frame whose change happens to be small can
+jump from 127 to QI and the next one back, which reads as the picture pumping.  Coarsening is
+never delayed, because delaying it is the lag this whole change exists to remove.
+
+THE QUANTIZER CONTROLLER on top of all of it is driven by the
 ENCODER'S OWN OUTPUT against the frame budget, measured BEFORE pacing — the old one compared
 post-pacing throughput with the target, which the pacer produces by construction, so it read
 'on target' for ever and never coarsened at all.  Then, once the screen has been quiet for
@@ -645,6 +691,21 @@ sleep, which is what keeps the capture clock independent of the link rate."
                ;; size those two produce
                (fps-want 0d0) (fps-cap 0d0) (frame-budget 0) (idle-budget 0)
                (cur-qi qi) (qi-bias 0) (stale-qi qi)
+               ;; the quantizer the last LIVE frame was coded at, and the only thing
+               ;; *MOTION-QI-EASE* reads.  Reset to QI the moment the screen goes quiet, so a
+               ;; burst of coarse motion cannot slow the refinement arc that follows it.
+               (moving-qi qi)
+               ;; TWO DEGREES OF NOT FITTING, and they are worth separate counts because they
+               ;; have separate remedies.  OVERRUNS: no quantizer up to the MOTION ceiling could
+               ;; cover the change inside the frame-rate budget, so the frame spent up to the
+               ;; latency ceiling instead — whole and current, but bigger than the cadence wanted.
+               ;; Before the motion ceiling was separated from MAX-QI this was every frame of
+               ;; every scroll from 160 kbps up, and it is what "sharp but laggy" was made of.
+               ;; DEFERRALS: even the latency ceiling was too small, so part of the change was
+               ;; carried to a later frame and the viewer is briefly shown a patchwork.  A rung
+               ;; that keeps doing either is short of MACROBLOCKS rather than of quantizer, and
+               ;; only resolution moves it.
+               (overruns 0) (deferrals 0)
                ;; THE RESOLUTION DIVISOR NOW IN FORCE, and when it last changed.  SCALE-AT starts
                ;; at zero rather than at "now" so the FIRST picture is free to be small: a session
                ;; start is global damage by definition, there is no delivered detail to protect,
@@ -685,12 +746,21 @@ sleep, which is what keeps the capture clock independent of the link rate."
                        key-qi       (or (getf p :key-qi) key-qi)
                        key-secs     (or (getf p :key-secs) key-secs)
                        target-fps   (or (getf p :target-fps) target-fps)
-                       cur-qi       (min (max cur-qi qi) max-qi))
+                       ;; the MOTION ceiling, which a rung may name and which defaults to the
+                       ;; coarsest quantizer the format has.  Never finer than MAX-QI: this knob
+                       ;; exists to let a LIVE frame go coarser than the settled picture, so a
+                       ;; rung setting it below MAX-QI would only be re-creating the clamp.
+                       motion-qi    (max (or (getf p :motion-qi) motion-qi) max-qi)
+                       ;; CUR-QI is the quantizer the last frame ACTUALLY used, and during motion
+                       ;; that is now allowed past MAX-QI — clamping it here would make the
+                       ;; report lie about the frame that just went out.
+                       cur-qi       (min (max cur-qi qi) (max max-qi motion-qi)))
                  (unless (equal p *video-profile-applied*)
                    (setf *video-profile-applied* p)
                    (when log
-                     (funcall log (format nil "profile ~@[~a ~]applied live: qi ~a/~a key-qi ~a target ~,2f KB/s ~,1f fps frame<=~,1f KB cleanup ~a ms resync ~,0f s"
-                                          (getf p :name) qi max-qi (or key-qi qi) target-kbs
+                     (funcall log (format nil "profile ~@[~a ~]applied live: qi ~a/~a (motion ~a) key-qi ~a target ~,2f KB/s ~,1f fps frame<=~,1f KB cleanup ~a ms resync ~,0f s"
+                                          (getf p :name) qi max-qi motion-qi (or key-qi qi)
+                                          target-kbs
                                           target-fps max-frame-kb cleanup-ms key-secs))))))
              (handler-case
                  (progn
@@ -918,13 +988,36 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             (mo-ceiling (min link-ceiling
                                              (max budget
                                                   (+ (ceiling live-overhead) (floor budget 2)))))
+                            ;; THE MOTION CEILING, WHICH IS NOT THE SETTLING ONE.  MAX-QI says
+                            ;; how coarse the picture is allowed to STAY; this says how coarse
+                            ;; one frame may be while the screen is moving, and it has to reach
+                            ;; the coarsest the format has at every rate or motion cannot be
+                            ;; made cheap.  See the account in START-VIDEO's docstring: with
+                            ;; MAX-QI doing both jobs, every rung from 160 kbps up was capped at
+                            ;; 52 during a scroll, nothing in [QI, 52] ever fit, and every frame
+                            ;; took the overrun path below and spent up to LINK-CEILING.
+                            (mo-qi (max max-qi (min 127 motion-qi)))
                             (fit (multiple-value-list
-                                  (fit-frame nnew bpu live-overhead qi max-qi
+                                  (fit-frame nnew bpu live-overhead qi mo-qi
                                              mo-ceiling link-ceiling)))
                             (fq (first fit))
                             (ceiling-bytes (second fit))
                             (fits (third fit))
-                            (useq (max qi (min max-qi (+ fq qi-bias))))
+                            ;; SHARPEN SLOWLY, COARSEN AT ONCE.  FQ is whatever this frame's
+                            ;; change happens to fit in, and once the ceiling is unclamped that
+                            ;; can be 127 on one frame and QI on the next — the picture pumping
+                            ;; between mush and detail while the user is still scrolling.  So a
+                            ;; live frame may only step *finer* by *MOTION-QI-EASE* per frame
+                            ;; while the screen is moving; going coarser is never delayed,
+                            ;; because a delayed coarsening is exactly the lag being removed.
+                            ;; MOVING-QI is reset to QI whenever the screen goes quiet, so the
+                            ;; ease never stands between the refinement pass and its target.
+                            (useq (let ((want (max qi (min mo-qi (+ fq qi-bias)))))
+                                    (if (and (plusp *motion-qi-ease*)
+                                             (< want moving-qi)
+                                             (> moving-qi qi))
+                                        (max want (- moving-qi *motion-qi-ease*))
+                                        want)))
                             ;; WHEN THE WHOLE SCREEN CHANGED, A KEYFRAME IS THE CHEAP WAY TO
                             ;; COVER IT.  An inter macroblock cannot use intra prediction, so
                             ;; coding 4000 unrelated macroblocks as a delta costs about twice
@@ -1189,7 +1282,18 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                        ;; the translating part is charged to the overhead here
                                        ;; too and is not rationed.
                                        (cap (unless fits
+                                              (incf deferrals)
                                               (mbs-fitting ceiling-bytes bpu live-overhead useq))))
+                                   ;; THE FALLBACK, COUNTED WHERE IT ACTUALLY HAPPENS.  FIT-FRAME
+                                   ;; hands back the LATENCY ceiling instead of the frame-rate
+                                   ;; budget when no quantizer it was allowed could cover the
+                                   ;; change — that is the "spend up to the ceiling rather than
+                                   ;; defer" path, and it is the one that used to fire on every
+                                   ;; frame of every scroll above 160 kbps.  It is NOT the same
+                                   ;; thing as FITS, which asks the much rarer question of
+                                   ;; whether even the ceiling is too small; that one defers, and
+                                   ;; is counted just above.
+                                   (when (> ceiling-bytes mo-ceiling) (incf overruns))
                                    (multiple-value-bind (f nmb defer mv eqi nmoved)
                                            (with-timing (st-enc)
                                              (vp8::encode-inter-frame
@@ -1205,6 +1309,10 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                          (setf pending defer)
                                          (when eqi (setf useq eqi))
                                          (setf cur-qi useq
+                                               ;; what the ease measures its next step from, and
+                                               ;; it is the quantizer the ENCODER settled on
+                                               ;; (EQI above), not the one we asked for
+                                               moving-qi useq
                                                stale-qi (if (> useq qi)
                                                             (max stale-qi useq) stale-qi))
                                          (when nmoved (ps-note st-mv nmoved))
@@ -1254,6 +1362,12 @@ sleep, which is what keeps the capture clock independent of the link rate."
                        ;; whatever the branch above did with them, the captured screen has now
                        ;; been coded (or was not needed): start accumulating again
                        (setf cap-y nil cap-u nil cap-v nil cap-dirty nil cap-scan nil)
+                       ;; THE EASE IS A MOTION RULE AND THE MOTION IS OVER.  *MOTION-QI-EASE*
+                       ;; slows how fast a live frame may sharpen so a scroll does not pump; the
+                       ;; refinement pass that follows a scroll is not a live frame and must not
+                       ;; inherit its brake, or the arc back to QI would take a quantizer step at
+                       ;; a time.  Same gate the idle passes use, for the same reason.
+                       (when (> idle-ms cleanup-ms) (setf moving-qi qi))
                        ;; publish the resolution the source should hand us next.  The source reads
                        ;; it when it next produces a frame, so the switch costs one poll, not a
                        ;; restart — the same shape as *VIDEO-PROFILE*.
@@ -1340,9 +1454,15 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       :moved-mb (list (ps-min st-mv) (/ (ps-total st-mv) (max 1 (ps-n st-mv))) (ps-max st-mv))
                                       :bytes-per-moved-mb mpu
                                       :pending (if pending (count 1 pending) 0)
+                                      ;; live frames that could not be covered inside their
+                                      ;; budget even at the MOTION ceiling and took the latency
+                                      ;; ceiling instead.  Supposed to be rare; when it is not,
+                                      ;; the rung is short of macroblocks rather than of
+                                      ;; quantizer, and only resolution moves it.
+                                      :overruns overruns :deferrals deferrals
                                       :cleanups cleanups)))
                      (when (and log (> dt 5000))
-                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B idle<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | cleans ~a"
+                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B idle<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | over ~a defer ~a | cleans ~a"
                                             (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
                                             (ps-line st-send) (ps-line st-kb) (ps-line st-mbs)
                                             (ps-line st-mv)
@@ -1352,11 +1472,11 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                             sc scale-drops scale-ups
                                             cur-qi (and (plusp qi-bias) qi-bias)
                                             (* bpu (qi-cost cur-qi)) mpu
-                                            (if pending (count 1 pending) 0) cleanups))
+                                            (if pending (count 1 pending) 0) overruns deferrals cleanups))
                        (ps-reset st-take) (ps-reset st-enc) (ps-reset st-send) (ps-reset st-loop)
                        (ps-reset st-clean) (ps-reset st-kb) (ps-reset st-mbs) (ps-reset st-qi)
                        (ps-reset st-mv) (ps-reset st-lag)
-                       (setf sent 0 skipped 0 bytes 0 takes 0 cleanups 0
+                       (setf sent 0 skipped 0 bytes 0 takes 0 cleanups 0 overruns 0 deferrals 0
                              last-report (get-internal-real-time)))))
                (error (e) (when log (funcall log (format nil "video tx: ~a" e)))))
              ;; poll on a short tick: the capture clock and the link are both checked here, and
