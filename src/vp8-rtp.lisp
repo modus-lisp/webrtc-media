@@ -199,6 +199,68 @@ genuinely new content still arrives whole, in one slow frame, exactly as it did 
         (values q budget t)
         (values q ceiling (<= (* n bpu (qi-cost q)) (max 0 (- ceiling overhead)))))))
 
+;;; ---- idle work is not exempt from the frame budget --------------------------
+;;;
+;;; Two frames carry nothing the viewer is waiting for: the REFINEMENT pass, which re-codes finer
+;;; what was already delivered coarse, and the DRAIN, which finishes what a live frame could not
+;;; fit.  Both run while the desktop is idle, and both used to keep the LINK-TIME ceiling that live
+;;; frames were freed from — on the reasoning that nothing is waiting behind them, so a smaller
+;;; frame would buy nobody anything.
+;;;
+;;; THAT REASONING HOLDS FOR EXACTLY AS LONG AS THE SCREEN STAYS IDLE.  A frame handed to the pacer
+;;; cannot be recalled: the moment the user scrolls or clicks, whatever is in flight is added to how
+;;; long the response waits, and an idle frame sized in link-seconds is measured in seconds.  From a
+;;; live session at the 320 kbps rung: refinement frames of 50 to 107 KB, 2.8 to 4.4 s each on a
+;;; 39 KB/s link, against a live frame budget of 3333 bytes.  The user's report was "still laggy at
+;;; 320 kbps", and it is worse at the TOP of the ladder, not the bottom, because a faster link lets
+;;; the refinement pick a finer quantizer and so build a bigger frame.
+;;;
+;;; So an idle frame gets the LIVE frame's budget too, times a small multiple, and the refinement
+;;; converges over many small frames instead of one huge one.  There is nothing to trade away in
+;;; doing so: refinement is DIFFERENTIAL (see QI-STEP-COST), so it can stop anywhere and resume from
+;;; where it stopped.  What it costs is the fixed per-frame overhead, once per extra frame — which
+;;; is why the multiple is not 1.
+
+(defparameter *idle-frame-x* 2
+  "How many LIVE frame budgets one IDLE frame — a refinement pass, a deferred drain — may spend.
+
+This is the LATENCY half of the bound, and it is stated in frames because that is the unit the
+delay is felt in: an idle frame already on the wire delays the next live one by at most this many
+frame times.
+
+WHY NOT 1.  Every inter frame pays its skip flags whatever it codes, and each extra frame the
+refinement arc is split into pays them again.  Measured, a whole screen refined from a coarse
+keyframe to the rung's own quantizer, total bytes at 1 / 2 / 4 live budgets per frame: 24.0 / 17.6 /
+15.7 KB at 20 kbps, 82.3 / 57.9 / 50.7 at 40, 317.8 / 137.0 / 117.3 at 80, 368.4 / 199.6 / 168.8 at
+160, 99.7 / 85.2 / 79.8 at 320.  One is a third to a half more expensive than two, everywhere.")
+
+(defparameter *idle-overhead-x* 9
+  "The other half of the bound: the fewest times its own fixed overhead an idle frame may be.
+
+*IDLE-FRAME-X* alone is not enough, because BELOW 320 kbps THE LIVE BUDGET IS ITSELF AT A FLOOR.
+FRAME-FPS-CAP will not let a live frame be smaller than *FRAME-OVERHEAD-X* — three — times the skip
+flags, and at 20 through 160 kbps the requested cadence is above that cap, so the live budget IS
+three times the flags exactly.  Two of those is six, and a sixth of every refinement frame is then
+overhead.  This says nine instead: three live-frame floors, so an idle frame is at most a ninth
+flags whatever the rung.
+
+Measured on the session bench, time from the scroll stopping to within 1 dB of the picture the
+UNBOUNDED refinement settled on, at 2 / 3 / 4 live budgets per idle frame, against the unbounded
+arm: 25.2 / 25.0 / 24.1 against 26.7 s at 20 kbps; 23.7 / 21.5 / 21.3 against 23.4 at 40; 22.9 /
+20.2 / 19.0 against 16.5 at 80; 18.7 / 16.8 / 15.5 against 14.9 at 160; 8.4 / 8.1 / 8.0 against 7.7
+at 320.  At 320, where the live budget is set by the cadence and not by the flags, two is already
+worth as much as four and costs half the stall; below it, the extra room is worth two to four
+seconds of the arc and costs a tenth of a second of stall.  Nine is where those two readings meet:
+it is three live budgets at every rung the flags bind, and it is under two at 320, where they do
+not.")
+
+(defun idle-frame-budget (budget overhead)
+  "The bytes an idle frame may spend: *IDLE-FRAME-X* live frames' worth, or *IDLE-OVERHEAD-X* times
+its own skip flags, whichever is more.  The first bounds the delay it can impose, the second keeps
+it from being mostly flags — and which one binds says which of those two the rung is short of."
+  (max (* *idle-frame-x* (max 256 budget))
+       (* *idle-overhead-x* (max 64 (ceiling overhead)))))
+
 ;;; ---- resolution follows damage ---------------------------------------------
 ;;;
 ;;; The quantizer is not the last lever, and by this point it is not the binding one either.  Two
@@ -372,6 +434,19 @@ At 2.5 s the same scroll switches twice."
 (defvar *force-keyframe* nil)
 (defvar *video-profile-applied* nil)      ; last plist logged, so a switch is reported once
 
+(defvar *video-input-at* 0
+  "GET-INTERNAL-REAL-TIME of the last input event forwarded to the desktop, or 0 if the caller does
+not report any.  Set it from wherever key and pointer events go in; the sender only reads it.
+
+INPUT IS DAMAGE THAT HAS NOT HAPPENED YET.  The idle passes are gated on the screen having been
+quiet for CLEANUP-MS, and a screen is quiet for the whole round trip between a click landing on the
+desktop and the desktop repainting — which is precisely the window in which starting a refinement
+puts it in front of the response.  A keystroke is the cheapest possible warning that the picture is
+about to change, and it arrives on the channel we are already reading.  So it counts as activity for
+the purpose of starting idle work, and for nothing else: it does not touch the resolution rules, and
+it cannot starve refinement, because it only postpones it by the same CLEANUP-MS that real damage
+does.")
+
 (defun vp8-packetize (frame seq ts ssrc pt &key (max-payload *vp8-max-payload*))
   "Split a VP8 FRAME into a list of packed RTP packets (RFC 7741 minimal descriptor).
 SEQ is the starting sequence number; returns (values packets next-seq)."
@@ -432,9 +507,16 @@ link divided by it (MOTION-FRAME-BUDGET), so at 320 kbps a frame is a few kiloby
 several a second, where a budget stated in link-seconds gave one big sharp frame every couple of
 seconds at every rung alike.  The rate is CLAMPED by what the per-macroblock skip flags permit —
 below that clamp a frame is mostly flags and no picture — and both the request and the clamp are
-reported, so a rung sitting on its ceiling is visible as such.  Frames with nothing waiting behind
-them (refinement, deferred drain) keep the old link-time ceiling: they are idle-time work, and
-shrinking them buys nobody anything.
+reported, so a rung sitting on its ceiling is visible as such.
+
+IDLE WORK IS SIZED THE SAME WAY, times *IDLE-FRAME-X*.  A refinement or a drain runs while the
+desktop is quiet, and the temptation is to let it spend freely because nothing is waiting behind it
+— but the screen stops being quiet without warning, and a frame already handed to the pacer cannot
+be recalled, so the size of the idle frame in flight IS the delay on the next thing the user does.
+It is worst at the top of the ladder, where a fast link lets a refinement pick a fine quantizer and
+build a huge frame.  Both jobs are resumable, so being cut short costs one frame's skip flags; see
+*IDLE-FRAME-X* and IDLE-FRAME-BUDGET.  Input counts as activity for the purpose of starting them
+(*VIDEO-INPUT-AT*), because input is damage that has not happened yet.
 
 Quality adapts to the link: QI is the best (sharpest) quantizer, MAX-QI the worst we will fall
 back to, and TARGET-KBS the rate the pacer emits at.  The quantizer controller is driven by the
@@ -561,7 +643,7 @@ sleep, which is what keeps the capture clock independent of the link rate."
                ;; the frame-rate plan the last pass computed, kept out here only so the periodic
                ;; report can quote it: what we asked for, what the skip flags allow, and the byte
                ;; size those two produce
-               (fps-want 0d0) (fps-cap 0d0) (frame-budget 0)
+               (fps-want 0d0) (fps-cap 0d0) (frame-budget 0) (idle-budget 0)
                (cur-qi qi) (qi-bias 0) (stale-qi qi)
                ;; THE RESOLUTION DIVISOR NOW IN FORCE, and when it last changed.  SCALE-AT starts
                ;; at zero rather than at "now" so the FIRST picture is free to be small: a session
@@ -676,6 +758,14 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             ;; covered inside the frame-rate budget below
                             (link-budget (floor (* max-frame-kb 1024)))
                             (link-ceiling (* *frame-coverage-x* link-budget))
+                            ;; HOW LONG SINCE ANYTHING HAPPENED, counting input as something.  The
+                            ;; idle passes below are gated on this; the resolution rules are not
+                            ;; (they use QUIET, which is the desktop's own clock) — restoring full
+                            ;; resolution is not made wrong by a keystroke, and gating it on one
+                            ;; would let a jiggled mouse pin the picture small.
+                            (idle-ms (/ (* 1000d0 (- (get-internal-real-time)
+                                                     (max idle-since *video-input-at*)))
+                                        internal-time-units-per-second))
                             ;; THE FRAME-RATE BUDGET: a second of the link divided by the cadence
                             ;; we are trying to hold, clamped to what the skip flags leave room
                             ;; for.  This is the number that decides whether the next rung up buys
@@ -694,6 +784,9 @@ sleep, which is what keeps the capture clock independent of the link rate."
                             (plan (multiple-value-list
                                    (motion-frame-budget bps sfps overhead)))
                             (budget (first plan)) (feff (second plan)) (fcap (third plan))
+                            ;; ... and what an IDLE frame may spend, which is the same number times
+                            ;; a small multiple.  See *IDLE-FRAME-X*.
+                            (idle-room (idle-frame-budget budget overhead))
                             ;; what this frame is being asked to cover, and the finest quantizer
                             ;; that covers ALL of it inside the ceiling.  PENDING is dropped
                             ;; outright when the grid changed under it — it names macroblocks of a
@@ -936,15 +1029,19 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                      ;;      finer, once the screen has been quiet a moment.
                                      (let ((st (and enc (vp8::ve-stale-mbs enc))))
                                        (cond
-                                         ;; NOTE the ceiling: both jobs below run while the desktop
-                                         ;; is IDLE, so nothing is waiting behind them and there is
-                                         ;; no motion for a smaller frame to buy.  They keep the
-                                         ;; link-time ceiling; only LIVE frames are sized from the
-                                         ;; frame rate.
+                                         ;; NOTE the budget: both jobs below are bounded by the
+                                         ;; LIVE frame budget times *IDLE-FRAME-X*, not by the
+                                         ;; link-time ceiling.  Nothing is waiting behind them
+                                         ;; WHILE THE SCREEN IS IDLE, and the screen stops being
+                                         ;; idle without warning; a frame already handed to the
+                                         ;; pacer cannot be recalled, so its size is the floor on
+                                         ;; how long the next real change waits.  Both jobs resume
+                                         ;; exactly where they left off, so being cut short costs
+                                         ;; one frame's overhead and nothing else.
                                          ((and enc pending (position 1 pending))
                                           (let* ((ns (count 1 pending)))
                                             (multiple-value-bind (dq fits)
-                                                (fit-quantizer ns link-ceiling bpu overhead
+                                                (fit-quantizer ns idle-room bpu overhead
                                                                qi max-qi)
                                               (multiple-value-bind (f nmb defer mv eqi)
                                                   (with-timing (st-enc)
@@ -952,8 +1049,9 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                                      enc (vp8::ve-prev-y enc) (vp8::ve-prev-u enc)
                                                      (vp8::ve-prev-v enc)
                                                      :qi dq :dirty pending :force t :clean-qi qi
+                                                     :max-bytes idle-room
                                                      :max-mbs (unless fits
-                                                                (mbs-fitting link-ceiling bpu
+                                                                (mbs-fitting idle-room bpu
                                                                              overhead dq))))
                                                 (declare (ignore mv))
                                                 (setf pending defer)
@@ -980,60 +1078,76 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                          ;; pretty immediately before a full-size keyframe
                                          ;; overwrote all of it.
                                          ((and (= sc 1) (= sc-coded 1) st (position 1 st)
-                                               (> (/ (* 1000d0 (- (get-internal-real-time)
-                                                                  idle-since))
-                                                     internal-time-units-per-second)
-                                                  cleanup-ms))
+                                               (> idle-ms cleanup-ms))
                                           (incf cleanups)
-                                          ;; REFINE THE WHOLE STALE SET A STEP FINER whenever a
-                                          ;; step fits — the picture then improves everywhere at
-                                          ;; once and keeps improving, which is the second half of
-                                          ;; "coarse but complete, then sharp".  Only when no step
-                                          ;; would be an improvement do we fall back to sharpening
-                                          ;; a slice at the target quality.
+                                          ;; A SUBSET OF THE SCREEN, ALL THE WAY TO QI — never the
+                                          ;; whole screen a quantizer step at a time.  Both spend
+                                          ;; the same bytes per frame and they are not close.
                                           ;;
-                                          ;; HALF the ceiling a live frame gets, because a
-                                          ;; refinement is the one frame that must not be in the
-                                          ;; way: it is already committed to the link when the
-                                          ;; desktop changes, and whatever it costs is added to
-                                          ;; how long the NEXT real change waits.  Measured at
-                                          ;; 160 kbps: a 100 KB refinement held the link for 5 s
-                                          ;; across a window switch the sender already knew
-                                          ;; about.  Smaller steps, more of them.
+                                          ;; A step re-codes EVERY stale macroblock on every pass.
+                                          ;; The cost model says that is free — it prices a step as
+                                          ;; the difference between two quantizers, and differences
+                                          ;; telescope — but the model is describing a residual, and
+                                          ;; the encoder is re-sending a whole macroblock: its
+                                          ;; modes, its tokens, and the quantization error the last
+                                          ;; pass left for this one to undo.  Take a macroblock down
+                                          ;; in thirty steps and it is coded thirty times.
+                                          ;;
+                                          ;; A subset codes each macroblock ONCE, at the target, and
+                                          ;; pays only the frame overhead for being spread out.
+                                          ;; Measured from a coarse keyframe to the rung's own
+                                          ;; quantizer, same per-frame budget, subset -> step:
+                                          ;; 85 KB / 2.0 s -> 615 KB / 14.5 s at 320 kbps, 200 KB /
+                                          ;; 9.9 s -> 754 KB / 35.8 s at 160, 137 / 13.3 -> 550 /
+                                          ;; 48.4 at 80, 58 / 10.9 -> 318 / 49.9 at 40.  And the
+                                          ;; step arm ends up a WORSE picture (50.4 dB against 52.6
+                                          ;; at 320), because it stops when it runs out of steps
+                                          ;; rather than when it reaches QI.
+                                          ;;
+                                          ;; The visible difference is a band of sharpness sweeping
+                                          ;; down the screen instead of the whole picture lifting at
+                                          ;; once.  It sweeps several times faster.
                                           (let* ((ns (count 1 st))
                                                  ;; what the viewer already has, when it has
                                                  ;; anything: a macroblock stale at QI itself was
                                                  ;; never sent at all, and costs full price
-                                                 (from (and (> stale-qi qi) stale-qi)))
-                                            (multiple-value-bind (rq rfits)
-                                                (fit-quantizer ns (floor link-ceiling 2) rpu
-                                                               overhead qi max-qi from)
-                                              (let* ((whole (and rfits (<= rq (- stale-qi 2))))
-                                                     (useq (if whole rq qi))
-                                                     (cap (unless whole
-                                                            (mbs-fitting link-budget rpu overhead
-                                                                         qi from))))
-                                                (setf cur-qi useq)
-                                                (when whole (setf stale-qi rq))
-                                                (ps-note st-mbs (if cap (min ns cap) ns))
-                                                (multiple-value-bind (f nmb)
-                                                    (with-timing (st-clean)
-                                                      (vp8::encode-inter-frame
-                                                       enc (vp8::ve-prev-y enc)
-                                                       (vp8::ve-prev-u enc) (vp8::ve-prev-v enc)
-                                                       :qi useq :dirty (copy-seq st) :force t
-                                                       :clean-qi qi :max-mbs cap))
-                                                  ;; refinement pays for its own estimate: its
-                                                  ;; residual is nothing like a live frame's
-                                                  (when (and f nmb (>= nmb 16))
-                                                    (let ((m (/ (max 1d0 (- (length f) overhead))
-                                                                nmb
-                                                                (qi-step-cost useq from))))
-                                                      (setf rpu (if (> m rpu)
-                                                                    (+ (* 0.4d0 rpu) (* 0.6d0 m))
-                                                                    (+ (* 0.85d0 rpu)
-                                                                       (* 0.15d0 m))))))
-                                                  f)))))))))
+                                                 (from (and (> stale-qi qi) stale-qi))
+                                                 ;; how much of the stale set this frame can take,
+                                                 ;; and NIL for "all of it" — the estimate is a mean
+                                                 ;; over macroblocks that are not alike, so it is
+                                                 ;; the byte bound below, not this, that keeps the
+                                                 ;; promise
+                                                 (fit (mbs-fitting idle-room rpu overhead qi from))
+                                                 (cap (when (< fit ns) fit)))
+                                            (setf cur-qi qi)
+                                            ;; the set is only settled when the pass covers all of
+                                            ;; it; a slice leaves the rest exactly as coarse as it
+                                            ;; was, which is what FROM has to keep saying
+                                            (unless cap (setf stale-qi qi))
+                                            (ps-note st-mbs (if cap (min ns cap) ns))
+                                            (multiple-value-bind (f nmb)
+                                                (with-timing (st-clean)
+                                                  (vp8::encode-inter-frame
+                                                   enc (vp8::ve-prev-y enc)
+                                                   (vp8::ve-prev-u enc) (vp8::ve-prev-v enc)
+                                                   :qi qi :dirty (copy-seq st) :force t
+                                                   :clean-qi qi :max-mbs cap
+                                                   :max-bytes idle-room))
+                                              ;; refinement pays for its own estimate: its residual
+                                              ;; is nothing like a live frame's.  NMB is what the
+                                              ;; encoder actually coded, which under the byte bound
+                                              ;; is what the bound allowed rather than what CAP
+                                              ;; asked for — so this learns from the frame that
+                                              ;; happened and the next CAP is closer.
+                                              (when (and f nmb (>= nmb 16))
+                                                (let ((m (/ (max 1d0 (- (length f) overhead))
+                                                            nmb
+                                                            (qi-step-cost qi from))))
+                                                  (setf rpu (if (> m rpu)
+                                                                (+ (* 0.4d0 rpu) (* 0.6d0 m))
+                                                                (+ (* 0.85d0 rpu)
+                                                                   (* 0.15d0 m))))))
+                                              f)))))))
                                 ;; first frame, or a periodic refresh: keyframe, and it seeds the
                                 ;; reference the following inter frames predict from
                                 ((or need-key (/= w (vp8::ve-width enc))
@@ -1178,7 +1292,7 @@ sleep, which is what keeps the capture clock independent of the link rate."
                        ;; worth watching: when the cadence we asked for is above it, the rung is
                        ;; not short of BITS, it is short of macroblocks to spend them on, and no
                        ;; amount of bitrate will make the picture move any faster at this size.
-                       (setf fps-want feff fps-cap fcap frame-budget budget)
+                       (setf fps-want feff fps-cap fcap frame-budget budget idle-budget idle-room)
                        (if frame
                            (progn
                              (setf sc-coded sc)
@@ -1215,6 +1329,7 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       ;; this rate and resolution, and the frame size they imply
                                       :target-fps fps-want :fps-cap fps-cap
                                       :frame-budget frame-budget
+                                      :idle-budget idle-budget
                                       ;; the resolution divisor now in force, and how often it has
                                       ;; moved: a rung that thrashes here is a rung whose
                                       ;; hysteresis is wrong, and it is invisible in every other
@@ -1227,13 +1342,13 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       :pending (if pending (count 1 pending) 0)
                                       :cleanups cleanups)))
                      (when (and log (> dt 5000))
-                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | cleans ~a"
+                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B idle<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | cleans ~a"
                                             (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
                                             (ps-line st-send) (ps-line st-kb) (ps-line st-mbs)
                                             (ps-line st-mv)
                                             sent skipped takes (/ bytes 1.024 dt)
                                             (/ (* 1000d0 sent) dt)
-                                            fps-want fps-cap (/ (* 1000d0 takes) dt) frame-budget
+                                            fps-want fps-cap (/ (* 1000d0 takes) dt) frame-budget idle-budget
                                             sc scale-drops scale-ups
                                             cur-qi (and (plusp qi-bias) qi-bias)
                                             (* bpu (qi-cost cur-qi)) mpu

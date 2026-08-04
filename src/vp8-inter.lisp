@@ -836,7 +836,15 @@ sharpness of wherever it came from and the idle pass still knows to come back fo
                     (and (>= bx 0) (< bx mc) (>= by 0) (< by mr)
                          (= 1 (aref marks (+ (* by mc) bx)))))))
 
-(defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12) max-mbs motion)
+(declaim (inline %coded-so-far))
+(defun %coded-so-far (bw tw)
+  "How many bytes of this frame are already written, near enough to bound it by.  The two
+partitions' buffers plus the three-byte tag and the two flushes the assembly below adds."
+  (declare (optimize (speed 3) (safety 0)))
+  (+ 11 (fill-pointer (bw-buf bw)) (fill-pointer (bw-buf tw))))
+
+(defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12) max-mbs max-bytes
+                                          motion)
   "Encode one inter frame of Y/U/V against the encoder's reference, updating the reference in
 place.  Unchanged macroblocks are skipped outright.  DIRTY, when given, is a per-macroblock bit
 vector of what the capture reported as updated — macroblocks it clears are skipped without
@@ -857,6 +865,17 @@ coding are left skipped and reported in the returned DEFERRED bit vector so the 
 them into the next frame.  That bounds FRAME SIZE, which is what actually bounds latency: one
 143 KB frame is ~570 ms in flight on a 250 KB/s link, and no average-rate control can see that.
 A big change then arrives as a couple of progressive frames instead of one long stall.
+
+MAX-BYTES bounds the same thing DIRECTLY, and it is the only one of the two that can promise
+anything.  A macroblock count is a byte count only through a per-macroblock AVERAGE, and the
+average is not what a slice of a desktop costs: a band of body text is several times a band of
+window chrome, so a caller that sizes its slice from the mean overruns whenever the slice lands on
+the dense part.  Measured on the refinement pass at 160 kbps, sizing by MAX-MBS alone against a
+3384 byte budget: 9518 bytes, 2.8x over.  With this the frame simply stops — the macroblocks it
+had not reached defer exactly as they do under MAX-MBS, so nothing new can happen to them.  The
+bound is approached from below and overshot by at most one macroblock's tokens plus the skip flags
+of the ones after it, which are unavoidable in any case.
+
 Returns (values bytes coded-mb-count deferred motion-vector quantizer translated).  QUANTIZER is
 the one the frame was ACTUALLY coded at, which is not always QI — see the backlog rule above.  A
 caller that models what a quantizer costs has to be told which one it got, or its next estimate is
@@ -873,12 +892,15 @@ caller learning what a translation costs learns it from the count that actually 
          (ru (the (simple-array (unsigned-byte 8) (*)) (ve-ref-u enc)))
          (rv (the (simple-array (unsigned-byte 8) (*)) (ve-ref-v enc)))
          (bw (make-bwriter)) (tw (make-bwriter)) (probs +default-coef-probs+)
+         ;; IS THIS A LIVE FRAME?  A frame coded from the encoder's own previous source is not
+         ;; carrying anything new — it is the idle pass sharpening what the viewer already holds,
+         ;; or the drain finishing what a live frame could not fit.  Two rules below turn on it.
+         (live (not (eq y (ve-prev-y enc))))
          ;; the quantizer this frame actually codes at: QI, unless a LIVE frame (one carrying a
          ;; new source, not a drain or a refinement — those must stay sharp, and a refinement that
          ;; coarsened would re-stale exactly what it just cleaned and never converge) wants far
          ;; more macroblocks than its budget allows, in which case coverage beats sharpness.
-         (eqi (if (and (plusp *backlog-qi*) max-mbs
-                       (not (eq y (ve-prev-y enc)))
+         (eqi (if (and (plusp *backlog-qi*) max-mbs live
                        (> (if dirty (count 1 (the simple-bit-vector dirty)) (* mc mr))
                           (* *backlog-x* (the fixnum max-mbs))))
                   (max qi (the fixnum *backlog-qi*))
@@ -1011,7 +1033,10 @@ caller learning what a translation costs learns it from the count that actually 
                            (%mb-moved-chroma-p v (ve-prev-v enc) sw sh cx cy2 gmvx gmvy ftmp cbuf)))
                (skip0 (or clean moved))
                ;; out of budget: leave it for the next frame rather than growing this one
-               (over (and max-mbs (not skip0) (>= coded (the fixnum max-mbs))))
+               (over (and (not skip0)
+                          (or (and max-mbs (>= coded (the fixnum max-mbs)))
+                              (and max-bytes (>= (%coded-so-far bw tw)
+                                                 (the fixnum max-bytes))))))
                (skip (or skip0 over))
                (mvx 0) (mvy 0))
           (declare (type fixnum mvx mvy))
@@ -1019,11 +1044,20 @@ caller learning what a translation costs learns it from the count that actually 
           (when over
             (unless deferred (setf deferred (make-array (* mc mr) :element-type 'bit :initial-element 0)))
             (setf (aref (the simple-bit-vector deferred) mbi) 1)
-            ;; the viewer has NOT been shown this macroblock.  Both sets: STALE so the idle
-            ;; refinement comes back for it even if the carry-forward is lost, and UNSENT so
-            ;; nothing translates from it while it is still owed.
+            ;; STALE always: whatever this frame was for, this macroblock did not get it, so the
+            ;; idle pass has to come back for it even if the carry-forward is lost.
             (let ((st (ve-stale-mbs enc))) (when st (setf (aref st mbi) 1)))
-            (let ((un (ve-unsent-mbs enc))) (when un (setf (aref un mbi) 1))))
+            ;; UNSENT only on a LIVE frame, and the distinction is the whole reason an idle frame
+            ;; may be small.  UNSENT means the viewer has never been shown these pixels, and it
+            ;; gates the motion vector: nothing may translate out of a macroblock the viewer does
+            ;; not have.  A macroblock a REFINEMENT ran out of budget for is not that — the viewer
+            ;; holds it, at a coarse quantizer, which is exactly the case the vector gate was
+            ;; changed to allow.  Marking it unsent would make every bounded refinement pass hand
+            ;; the next scroll a screenful of un-translatable macroblocks, and a scroll that cannot
+            ;; translate is a keyframe.  (The drain's macroblocks ARE unsent, and stay so: the live
+            ;; frame that deferred them set the bit and only coding clears it.)
+            (when live
+              (let ((un (ve-unsent-mbs enc))) (when un (setf (aref un mbi) 1)))))
           ;; choose the prediction: the global vector only if it beats the co-located one
           (cond
             (moved (setf mvx gmvx mvy gmvy))

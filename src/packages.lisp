@@ -30,5 +30,8 @@
    #:start-audio #:start-video #:vp8-packetize
    ;; live quality switching: set this and a RUNNING sender adopts it (see vp8-rtp.lisp)
    #:*video-profile* #:*force-keyframe*
+   ;; input is damage that has not happened yet: set this where key/pointer events are forwarded
+   ;; and the idle passes will not start in front of the response (see vp8-rtp.lisp)
+   #:*video-input-at*
    ;; resolution follows damage: the sender picks a divisor, the frame source honours it
    #:*video-scale* #:video-scale))
