@@ -36,5 +36,10 @@
    ;; input is damage that has not happened yet: set this where key/pointer events are forwarded
    ;; and the idle passes will not start in front of the response (see vp8-rtp.lisp)
    #:*video-input-at*
+   ;; where the user is looking: report pointer events here (or hand the raw RFB client bytes to
+   ;; NOTE-RFB-INPUT) and a budget-bound frame is spent nearest the cursor first (see vp8-rtp.lisp)
+   #:note-pointer #:note-rfb-input
+   #:*pointer-x* #:*pointer-y* #:*pointer-at*
+   #:*pointer-fresh-secs* #:*cursor-priority* #:*cursor-defer-max-ms*
    ;; resolution follows damage: the sender picks a divisor, the frame source honours it
    #:*video-scale* #:video-scale))

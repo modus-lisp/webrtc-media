@@ -465,6 +465,222 @@ the purpose of starting idle work, and for nothing else: it does not touch the r
 it cannot starve refinement, because it only postpones it by the same CLEANUP-MS that real damage
 does.")
 
+;;; ---- where the user is looking ---------------------------------------------
+;;;
+;;; A budget that cannot cover the whole change has to leave some of it out, and until now the
+;;; choice of WHICH was made by the raster scan: the frame coded from the top of the screen down
+;;; until the bytes ran out.  That is an ordering, but it is not a priority — it says the top of
+;;; the screen matters more than the bottom, which is true of nothing anyone does with a desktop.
+;;;
+;;; THE POINTER IS THE PRIORITY.  The case this sender is judged on is a window drag, and during a
+;;; drag the user's attention is at the cursor by construction: the title bar is under it, the
+;;; question being asked is "where is this window now", and the answer is a band of pixels a
+;;; hundred wide around the pointer.  Spend the budget there and the drag can be steered; spread
+;;; the same bytes evenly and it cannot, however much of the screen they cover.  Every complaint
+;;; this sender has ever had has been about LATENCY, never about the picture being patchy — so
+;;; patchy-but-current at the point of attention is the trade to make, provided the patchiness is
+;;; aimed at something.  This is what aims it.
+;;;
+;;; The position costs nothing to obtain: RFB PointerEvents already pass through the gateway on
+;;; their way to the desktop, and NOTE-RFB-INPUT reads them off that stream without disturbing the
+;;; forwarding.  Last-known (x,y) plus the time it arrived is the whole state.
+
+(defvar *pointer-x* -1 "Last pointer X reported to NOTE-POINTER, in FULL-RESOLUTION framebuffer pixels.")
+(defvar *pointer-y* -1 "Last pointer Y reported to NOTE-POINTER, in FULL-RESOLUTION framebuffer pixels.")
+(defvar *pointer-at* 0
+  "GET-INTERNAL-REAL-TIME of the last pointer report, or 0 if nothing has ever reported one.")
+
+(defparameter *pointer-fresh-secs* 4d0
+  "How long a pointer position is taken to say where the user is looking.
+
+A STALE CURSOR IS WORSE THAN NO CURSOR.  With no recent pointer at all — a keyboard-only session,
+a viewer that never connected, a harness driving the encoder directly — the budget should be spent
+exactly as it was before this existed, in scan order, because there is nothing better to say.  With
+a pointer that has not moved for a minute the prioritiser would happily keep clustering every
+update around wherever it was left, which is not a degradation of the old behaviour, it is a
+regression on it: the periphery is starved for the sake of a place nobody is looking.
+
+Four seconds is chosen against the thing being prioritised.  During a drag, pointer events arrive
+continuously — a browser sends one per mouse move — so the position is never more than a frame old
+while it matters, and the window only has to outlast the pauses WITHIN a gesture (a drag that
+stops to let the picture catch up, a menu held open) rather than the gesture itself.  Past it the
+sender reverts to scan order rather than guessing.")
+
+(defparameter *cursor-priority* nil
+  "Order a budget-bound frame's macroblocks by distance from the pointer.  NIL — the default —
+restores the raster-order cut exactly.
+
+OFF BY DEFAULT BECAUSE IT WAS MEASURED AND IT LOST.  The hypothesis was that a drag's budget
+should be spent at the cursor, since the title bar is under it and steering the window is what the
+user is doing.  It is a good hypothesis and it is wrong here, for a reason worth writing down.
+
+A WINDOW DRAG IS NOT SHORT OF BUDGET.  On the real 1280x800 capture, at 160 and 480 kbps, a drag's
+frames arrive ~10 ms apart, the picture has moved 8 px between them, and the frame's global vector
+carries 1700-1800 of the ~1840 changed macroblocks outright.  The residual is the leading and
+trailing edge — about a hundred macroblocks that cost 0.5 BYTES EACH at the quantizer the fit
+picks, because a four-pixel shift of desktop content quantizes to almost nothing.  A whole drag
+frame is 0.8-2.5 KB against a 1.7 KB cadence budget.  Measured time from the pointer reaching a
+position to the title bar under it being correct on screen, over 41 positions: median 0.12 s at
+160 kbps and 0.05 s at 480.  There is no latency there to remove.
+
+AND RATIONING IT DESTROYS THE TRANSLATION.  Deferral on a LIVE frame marks a macroblock UNSENT,
+and nothing may translate out of an unsent macroblock (see ENCODE-INTER-FRAME's MOVED test — the
+rule exists so a vector cannot hand the viewer pixels it never received).  The priority rule defers
+most of the change by construction, so the next frame's vector finds its source region unsent and
+refuses to carry it; that macroblock becomes new content, is deferred in turn, and the refusal
+spreads with the motion.  Measured over one 4 s drag at 160 kbps with the rule on, translated
+macroblocks per frame fell 1750 -> 0 in 2.5 s, the changed set grew 1758 -> 2400, and the same
+title-bar measurement went to a 0.23 s median with three positions never reached at all.
+
+THE RULE'S OWN TRIGGER IS ALSO OVER-EAGER, and this is what fires it on a drag in the first place.
+It fires when FIT-FRAME says no quantizer covers the change inside the cadence budget — but that
+verdict is computed from BPU, a learned MEAN cost per macroblock, and a drag's residual is ~20x
+cheaper than the mean.  The frame that is predicted not to fit in 1.7 KB actually codes in 0.8 KB.
+
+WHERE IT LOOKED LIKE HELPING IT WAS SURVIVORSHIP.  At 48 kbps, where the drag genuinely does
+overrun (one or two frames for the whole gesture, the accumulated damage mostly new rather than
+translated), the median improved 0.52 s -> 0.39 s and the p90 8.4 s -> 1.7 s — but the number of
+pointer positions whose title bar NEVER became correct went 16 -> 23 of 41, and coverage of the
+screen beyond twenty macroblocks from the cursor fell 86% -> 32%.  The positions that landed
+landed sooner because the ones that did not land were no longer competing for the budget.
+
+Kept, off, because the machinery is sound and cheap and the tap costs nothing: the pointer is
+recorded whatever this is set to, ENCODE-INTER-FRAME's :ALLOW is verified bit-exact against libvpx
+across the quantizer ladder, and the deadline rule works.  What is missing is a case where the
+budget genuinely binds AND deferral does not cost the vector — and finding one starts with the
+UNSENT rule, not with the ordering.")
+
+(defparameter *cursor-defer-max-ms* 1200d0
+  "How long a macroblock may be held back by the priority rule before it is admitted regardless.
+
+STARVATION IS THE OBVIOUS FAILURE MODE.  A clock ticking in the far corner while the user drags a
+window on the other side of the screen is damage that the distance rule will rank last on every
+frame, and a rule with no deadline would rank it last for ever — the periphery would not lag, it
+would stop.  So a macroblock the priority rule has refused carries the time it was first refused,
+and once it has been waiting this long it sorts at distance zero: ahead of everything the cursor
+is not directly on.  That converts \"starved\" into \"bounded\", and the bound is this number plus
+one frame time.
+
+It is deliberately longer than a frame and shorter than a gesture.  Shorter, and a drag's own
+trailing edge would keep re-admitting itself and there would be no prioritisation left; longer,
+and a change away from the cursor would visibly stall.  1.2 s is about the length of a flick and
+about four frame times at the rungs where the budget binds at all.")
+
+(defun note-pointer (x y)
+  "Record the pointer at (X,Y) in full-resolution framebuffer pixels.  Cheap enough to call on
+every mouse move: three stores and no allocation."
+  (setf *pointer-x* x *pointer-y* y *pointer-at* (get-internal-real-time))
+  (values))
+
+(defun note-rfb-input (bytes)
+  "Read a client->server RFB message (or a run of them) for its LAST PointerEvent and record it.
+
+The gateway forwards these bytes to the desktop verbatim; this only looks.  RFB client messages are
+self-delimiting once the type byte is known (RFC 6143 s7.5), so the scan walks them and stops at the
+first thing it does not recognise rather than guessing a length — a truncated or coalesced buffer
+then costs one missed position, never a misread one.  Returns T if a position was found."
+  (let ((n (length bytes)) (i 0) (px nil) (py nil))
+    (declare (type fixnum n i))
+    (loop while (< i n) do
+      (let ((type (aref bytes i)))
+        (case type
+          (0 (incf i 20))                                   ; SetPixelFormat
+          (2 (if (<= (+ i 4) n)                             ; SetEncodings: 4 + 4*count
+                 (incf i (+ 4 (* 4 (+ (ash (aref bytes (+ i 2)) 8) (aref bytes (+ i 3))))))
+                 (return)))
+          (3 (incf i 10))                                   ; FramebufferUpdateRequest
+          (4 (incf i 8))                                    ; KeyEvent
+          (5 (if (<= (+ i 6) n)                             ; PointerEvent: mask, u16 x, u16 y
+                 (progn (setf px (+ (ash (aref bytes (+ i 2)) 8) (aref bytes (+ i 3)))
+                              py (+ (ash (aref bytes (+ i 4)) 8) (aref bytes (+ i 5))))
+                        (incf i 6))
+                 (return)))
+          (6 (if (<= (+ i 8) n)                             ; ClientCutText: 8 + u32 length
+                 (incf i (+ 8 (loop with v of-type (unsigned-byte 32) = 0
+                                    for k from (+ i 4) below (+ i 8)
+                                    do (setf v (+ (ash v 8) (aref bytes k)))
+                                    finally (return v))))
+                 (return)))
+          (t (return)))))
+    (when px (note-pointer px py) t)))
+
+(defun pointer-mb (mc mr)
+  "The pointer in MACROBLOCK coordinates on an MC x MR grid, as (values MBX MBY), or NIL when there
+is no usable position.  Divides by *VIDEO-SCALE*, because the pointer is reported against the
+desktop and the encoder may be coding a box-filtered fraction of it."
+  (when (and *cursor-priority* (plusp *pointer-at*) (>= *pointer-x* 0))
+    (let ((age (/ (float (- (get-internal-real-time) *pointer-at*) 1d0)
+                  internal-time-units-per-second))
+          (s (max 1 *video-scale*)))
+      (when (<= age *pointer-fresh-secs*)
+        (let ((mbx (floor (floor *pointer-x* s) 16))
+              (mby (floor (floor *pointer-y* s) 16)))
+          (when (and (< -1 mbx mc) (< -1 mby mr))
+            (values mbx mby)))))))
+
+(defun overdue-mbs (defer-at now limit-ms)
+  "The macroblocks the priority rule has been holding back for longer than LIMIT-MS, as a bit
+vector, or NIL when none has.  DEFER-AT holds, per macroblock, the GET-INTERNAL-REAL-TIME at which
+it was FIRST refused (0 for one that is not being held back), so this measures the wait itself and
+not how many frames have gone by — a rung that produces one frame a second and one that produces
+twelve owe the far corner the same seconds of staleness.  See *CURSOR-DEFER-MAX-MS*."
+  (when defer-at
+    (let ((n (length defer-at)) (out nil)
+          (cut (- now (round (* limit-ms internal-time-units-per-second) 1000))))
+      (dotimes (i n out)
+        (let ((at (aref defer-at i)))
+          (when (and (plusp at) (<= at cut))
+            (unless out (setf out (make-array n :element-type 'bit :initial-element 0)))
+            (setf (aref out i) 1)))))))
+
+(defun cursor-allow (want mc mr mbx mby k overdue)
+  "Select the K macroblocks of WANT nearest (MBX,MBY) — plus every macroblock OVERDUE marks — and
+return them as a bit vector ENCODE-INTER-FRAME's ALLOW takes.  NIL when the whole of WANT fits.
+
+RINGS, IN EUCLIDEAN DISTANCE.  The ordering is by round(sqrt(dx^2+dy^2)) in macroblock units, so
+the admitted region grows as a disc rather than a square and a title bar is reached across its
+whole width at once; ties inside a ring fall out in raster order, which is where the last few
+macroblocks of a partly-filled ring come from.  A histogram over rings costs one pass and no
+consing, where a sort of four thousand keys costs neither of those things cheaply.
+
+OVERDUE, when given, is the set the deadline rule has forced in (see *CURSOR-DEFER-MAX-MS*); those
+sort at ring zero, ahead of the cursor's own macroblock, and are charged to K like anything else."
+  (declare (type simple-bit-vector want) (type fixnum mc mr mbx mby k))
+  (let* ((n (* mc mr))
+         (maxr (1+ (isqrt (+ (* (max mbx (- mc 1 mbx)) (max mbx (- mc 1 mbx)))
+                             (* (max mby (- mr 1 mby)) (max mby (- mr 1 mby)))))))
+         (hist (make-array (1+ maxr) :element-type 'fixnum :initial-element 0))
+         (total 0))
+    (declare (type fixnum n maxr total))
+    (flet ((ring (i)
+             (declare (type fixnum i))
+             (if (and overdue (= 1 (aref (the simple-bit-vector overdue) i)))
+                 0
+                 (let* ((dx (- (mod i mc) mbx)) (dy (- (floor i mc) mby)))
+                   (declare (type fixnum dx dy))
+                   ;; round(sqrt(d2)) without a float: the ring boundary is at r*r+r
+                   (let ((d2 (+ (* dx dx) (* dy dy))) (r 0))
+                     (declare (type fixnum d2 r))
+                     (setf r (isqrt d2))
+                     (if (> d2 (+ (* r r) r)) (1+ r) r))))))
+      (dotimes (i n)
+        (when (= 1 (aref want i))
+          (incf total)
+          (let ((r (min maxr (ring i)))) (incf (aref hist r)))))
+      (when (<= total k) (return-from cursor-allow nil))
+      ;; the ring the budget runs out in, and how many of it are left to take
+      (let ((cut 0) (room k))
+        (declare (type fixnum cut room))
+        (loop for r of-type fixnum from 0 to maxr
+              while (>= room (aref hist r))
+              do (decf room (aref hist r)) (setf cut (1+ r)))
+        (let ((allow (make-array n :element-type 'bit :initial-element 0)))
+          (dotimes (i n allow)
+            (when (= 1 (aref want i))
+              (let ((r (min maxr (ring i))))
+                (cond ((< r cut) (setf (aref allow i) 1))
+                      ((and (= r cut) (plusp room)) (setf (aref allow i) 1) (decf room)))))))))))
+
 (defun vp8-packetize (frame seq ts ssrc pt &key (max-payload *vp8-max-payload*))
   "Split a VP8 FRAME into a list of packed RTP packets (RFC 7741 minimal descriptor).
 SEQ is the starting sequence number; returns (values packets next-seq)."
@@ -705,7 +921,17 @@ sleep, which is what keeps the capture clock independent of the link rate."
                ;; carried to a later frame and the viewer is briefly shown a patchwork.  A rung
                ;; that keeps doing either is short of MACROBLOCKS rather than of quantizer, and
                ;; only resolution moves it.
-               (overruns 0) (deferrals 0)
+               ;; PRIORITISED: how many of those the cursor rule aimed.  When the budget binds and
+               ;; a fresh pointer position is on hand, the frame is cut to the frame-rate budget
+               ;; and spent nearest the cursor first instead of being spent to the latency ceiling
+               ;; in scan order — so this is the count of frames that were made SMALL AND PATCHY
+               ;; on purpose, and it should track OVERRUNS while anyone is dragging anything.
+               (overruns 0) (deferrals 0) (prioritised 0)
+               ;; WHEN EACH MACROBLOCK THE PRIORITY RULE REFUSED WAS FIRST REFUSED, or 0 for one it
+               ;; is not holding back.  This is the whole of the anti-starvation machinery: a
+               ;; macroblock that has been waiting past *CURSOR-DEFER-MAX-MS* is admitted at ring
+               ;; zero on the next budget-bound frame, whatever the cursor is doing.
+               (defer-at nil)
                ;; THE RESOLUTION DIVISOR NOW IN FORCE, and when it last changed.  SCALE-AT starts
                ;; at zero rather than at "now" so the FIRST picture is free to be small: a session
                ;; start is global damage by definition, there is no delivered detail to protect,
@@ -1084,7 +1310,7 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                 ;; the last source we saw, so a late receiver can start decoding
                                 ((and (null y) source enc (vp8::ve-have-ref enc)
                                       (or forced key-due))
-                                 (setf last-key (get-internal-real-time) pending nil
+                                 (setf last-key (get-internal-real-time) pending nil defer-at nil
                                        cur-qi kqi stale-qi (if (plusp kstale) kqi qi))
                                  (let ((py (vp8::ve-prev-y enc)) (pu (vp8::ve-prev-u enc))
                                        (pv (vp8::ve-prev-v enc))
@@ -1251,7 +1477,7 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                  ;; for ever after.
                                  ;; MKQI, not KQI: a keyframe the CONTENT asked for is sized by the
                                  ;; frame rate, a resync or a first picture by KEY-QI.  See MKQI.
-                                 (setf last-key (get-internal-real-time) pending nil
+                                 (setf last-key (get-internal-real-time) pending nil defer-at nil
                                        cur-qi mkqi stale-qi (if (plusp mkstale) mkqi qi))
                                  (setf enc (vp8::make-encoder w h))
                                  (multiple-value-bind (f ry ru rv)
@@ -1274,16 +1500,62 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                 ;; otherwise an inter frame, and this is the whole point: pick the
                                 ;; quantizer the CHANGE fits in, and code all of it.
                                 (t
-                                 (let ((useq useq)
-                                       ;; deferral survives for exactly one case: even MAX-QI
-                                       ;; overruns the ceiling, so code what fits and carry the
-                                       ;; rest.  On this ladder that is now rare rather than the
-                                       ;; normal path.  MAX-MBS bounds macroblocks that CODE, so
-                                       ;; the translating part is charged to the overhead here
-                                       ;; too and is not rationed.
-                                       (cap (unless fits
-                                              (incf deferrals)
-                                              (mbs-fitting ceiling-bytes bpu live-overhead useq))))
+                                 (let* ((useq useq)
+                                        ;; deferral survives for exactly one case: even MAX-QI
+                                        ;; overruns the ceiling, so code what fits and carry the
+                                        ;; rest.  On this ladder that is now rare rather than the
+                                        ;; normal path.  MAX-MBS bounds macroblocks that CODE, so
+                                        ;; the translating part is charged to the overhead here
+                                        ;; too and is not rationed.
+                                        (cap (unless fits
+                                               (incf deferrals)
+                                               (mbs-fitting ceiling-bytes bpu live-overhead useq)))
+                                        ;; ---- CURSOR-CENTRED PRIORITY ----------------------
+                                        ;; The frame is over its cadence budget: no quantizer up
+                                        ;; to the motion ceiling could cover this much change in
+                                        ;; the bytes one frame time is worth, so the rule above
+                                        ;; hands it the LATENCY ceiling and it arrives whole,
+                                        ;; four frame times late.  That is the right answer when
+                                        ;; there is nothing to say about which part of the change
+                                        ;; the user is waiting for.  When the pointer says which
+                                        ;; part, it is not: a drag asks "where is this window
+                                        ;; now", the answer is under the cursor, and the rest of
+                                        ;; the screen can arrive in the frames after this one.
+                                        ;;
+                                        ;; So: cut the frame back to the CADENCE budget and spend
+                                        ;; it nearest the pointer outward, deferring the rest into
+                                        ;; PENDING, which the next live frame re-offers (WANT is
+                                        ;; PENDING or DIRTY) and the idle drain finishes.
+                                        (squeeze (and want enc
+                                                      (or (not fits)
+                                                          (> ceiling-bytes mo-ceiling))))
+                                        (prio-mb (when squeeze
+                                                   (multiple-value-list
+                                                    (pointer-mb (vp8::ve-mb-cols enc)
+                                                                (vp8::ve-mb-rows enc)))))
+                                        (allow
+                                          (when (first prio-mb)
+                                            (let* ((pc (vp8::ve-mb-cols enc))
+                                                   (pr (vp8::ve-mb-rows enc))
+                                                   ;; how many macroblocks of genuinely NEW
+                                                   ;; content the cadence budget buys ...
+                                                   (knew (mbs-fitting mo-ceiling bpu
+                                                                      live-overhead useq))
+                                                   ;; ... and how many of WANT that is.  The
+                                                   ;; selection ranks the DIRTY set, but only its
+                                                   ;; non-translating part spends anything, so a
+                                                   ;; disc sized in coded macroblocks would be
+                                                   ;; sized for a population it is not selecting
+                                                   ;; from.  NWANT/NNEW is that ratio, from the
+                                                   ;; census PREDICT-MOTION already took.
+                                                   (kw (min nwant
+                                                            (max 8
+                                                                 (round (* knew nwant)
+                                                                        (max 1 nnew))))))
+                                              (cursor-allow
+                                               want pc pr (first prio-mb) (second prio-mb) kw
+                                               (overdue-mbs defer-at (get-internal-real-time)
+                                                            *cursor-defer-max-ms*))))))
                                    ;; THE FALLBACK, COUNTED WHERE IT ACTUALLY HAPPENS.  FIT-FRAME
                                    ;; hands back the LATENCY ceiling instead of the frame-rate
                                    ;; budget when no quantizer it was allowed could cover the
@@ -1294,11 +1566,22 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                    ;; whether even the ceiling is too small; that one defers, and
                                    ;; is counted just above.
                                    (when (> ceiling-bytes mo-ceiling) (incf overruns))
+                                   (when allow (incf prioritised))
                                    (multiple-value-bind (f nmb defer mv eqi nmoved)
                                            (with-timing (st-enc)
                                              (vp8::encode-inter-frame
                                               enc y u v :qi useq :dirty want :force t
                                               :clean-qi qi :max-mbs cap
+                                              ;; what the cursor rule selected, and the byte bound
+                                              ;; that makes the selection mean something.  The
+                                              ;; disc is sized from a per-macroblock MEAN, and a
+                                              ;; mean is not what a slice of a desktop costs, so
+                                              ;; the bound is what actually keeps the promise; the
+                                              ;; ordering is what decides which macroblocks are
+                                              ;; inside it when it binds.  Both NIL without a
+                                              ;; fresh pointer, which is the old behaviour exactly.
+                                              :allow allow
+                                              :max-bytes (when allow mo-ceiling)
                                               ;; the vector the estimate was made on.  :NONE when
                                               ;; the estimate found none — the encoder's own
                                               ;; search runs on the same pixels behind the same
@@ -1307,6 +1590,24 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                               :motion (if mvp (or gmv :none) nil)))
                                          (declare (ignore mv))
                                          (setf pending defer)
+                                         ;; age the held-back set, so nothing the cursor is far
+                                         ;; from can be refused for ever (*CURSOR-DEFER-MAX-MS*).
+                                         ;; Skipped entirely when the rule is off, so "off" is the
+                                         ;; old loop and not the old loop plus a bookkeeping pass.
+                                         (when *cursor-priority*
+                                           (let ((n (* (vp8::ve-mb-cols enc)
+                                                       (vp8::ve-mb-rows enc)))
+                                                 (now (get-internal-real-time)))
+                                             (unless (and defer-at (= (length defer-at) n))
+                                               (setf defer-at (make-array n :element-type 'fixnum
+                                                                            :initial-element 0)))
+                                             (if (null defer)
+                                                 (fill defer-at 0)
+                                                 (dotimes (i n)
+                                                   (if (= 1 (aref defer i))
+                                                       (when (zerop (aref defer-at i))
+                                                         (setf (aref defer-at i) now))
+                                                       (setf (aref defer-at i) 0))))))
                                          (when eqi (setf useq eqi))
                                          (setf cur-qi useq
                                                ;; what the ease measures its next step from, and
@@ -1460,9 +1761,13 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       ;; the rung is short of macroblocks rather than of
                                       ;; quantizer, and only resolution moves it.
                                       :overruns overruns :deferrals deferrals
+                                      ;; ... and how many of those the pointer aimed: cut back to
+                                      ;; the cadence budget and spent nearest the cursor outward
+                                      ;; rather than spent whole and late.
+                                      :prioritised prioritised
                                       :cleanups cleanups)))
                      (when (and log (> dt 5000))
-                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B idle<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | over ~a defer ~a | cleans ~a"
+                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B idle<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | over ~a (aimed ~a) defer ~a | cleans ~a"
                                             (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
                                             (ps-line st-send) (ps-line st-kb) (ps-line st-mbs)
                                             (ps-line st-mv)
@@ -1472,11 +1777,12 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                             sc scale-drops scale-ups
                                             cur-qi (and (plusp qi-bias) qi-bias)
                                             (* bpu (qi-cost cur-qi)) mpu
-                                            (if pending (count 1 pending) 0) overruns deferrals cleanups))
+                                            (if pending (count 1 pending) 0) overruns prioritised deferrals cleanups))
                        (ps-reset st-take) (ps-reset st-enc) (ps-reset st-send) (ps-reset st-loop)
                        (ps-reset st-clean) (ps-reset st-kb) (ps-reset st-mbs) (ps-reset st-qi)
                        (ps-reset st-mv) (ps-reset st-lag)
                        (setf sent 0 skipped 0 bytes 0 takes 0 cleanups 0 overruns 0 deferrals 0
+                             prioritised 0
                              last-report (get-internal-real-time)))))
                (error (e) (when log (funcall log (format nil "video tx: ~a" e)))))
              ;; poll on a short tick: the capture clock and the link are both checked here, and

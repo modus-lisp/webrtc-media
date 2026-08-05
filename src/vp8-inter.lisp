@@ -844,7 +844,7 @@ partitions' buffers plus the three-byte tag and the two flushes the assembly bel
   (+ 11 (bw-fill bw) (bw-fill tw)))
 
 (defun encode-inter-frame (enc y u v &key (qi 12) dirty force (clean-qi 12) max-mbs max-bytes
-                                          motion)
+                                          motion allow)
   "Encode one inter frame of Y/U/V against the encoder's reference, updating the reference in
 place.  Unchanged macroblocks are skipped outright.  DIRTY, when given, is a per-macroblock bit
 vector of what the capture reported as updated — macroblocks it clears are skipped without
@@ -875,6 +875,19 @@ the dense part.  Measured on the refinement pass at 160 kbps, sizing by MAX-MBS 
 had not reached defer exactly as they do under MAX-MBS, so nothing new can happen to them.  The
 bound is approached from below and overshot by at most one macroblock's tokens plus the skip flags
 of the ones after it, which are unavoidable in any case.
+
+ALLOW, when given, is a per-macroblock bit vector saying which macroblocks this frame may spend
+RESIDUAL bytes on.  A macroblock it clears defers exactly as one past MAX-BYTES does — it is not
+coded, it is marked stale (and unsent, on a live frame) and it comes back in DEFERRED.  It is the
+same gate as the two bounds above, moved from \"whatever the raster scan reached first\" to
+\"whatever the caller ranked first\", and that is its whole reason for existing: a bound that cuts
+in scan order spends the budget on the top of the screen, which is a place, not a priority.
+
+IT DOES NOT GATE TRANSLATION, and must not.  A macroblock the frame's vector carries outright is
+already free — a mode bit and a vector reference, no coefficients — so it is settled above this
+test and rides the vector whether ALLOW selects it or not.  Rationing those would price a drag as
+new content, which is the thing the vector exists to avoid; what is rationed here is the genuinely
+new content, which is the only part a quantizer or a budget can trade against.
 
 Returns (values bytes coded-mb-count deferred motion-vector quantizer translated).  QUANTIZER is
 the one the frame was ACTUALLY coded at, which is not always QI — see the backlog rule above.  A
@@ -1035,9 +1048,13 @@ caller learning what a translation costs learns it from the count that actually 
                            (%mb-moved-chroma-p u (ve-prev-u enc) sw sh cx cy2 gmvx gmvy ftmp cbuf)
                            (%mb-moved-chroma-p v (ve-prev-v enc) sw sh cx cy2 gmvx gmvy ftmp cbuf)))
                (skip0 (or clean moved))
-               ;; out of budget: leave it for the next frame rather than growing this one
+               ;; out of budget: leave it for the next frame rather than growing this one.
+               ;; ALLOW is the same decision taken by the caller in ITS order rather than by the
+               ;; scan in raster order — see the note in the docstring.  Both are tested after
+               ;; SKIP0, so nothing that merely translates is ever refused by either.
                (over (and (not skip0)
-                          (or (and max-mbs (>= coded (the fixnum max-mbs)))
+                          (or (and allow (zerop (aref (the simple-bit-vector allow) mbi)))
+                              (and max-mbs (>= coded (the fixnum max-mbs)))
                               (and max-bytes (>= (%coded-so-far bw tw)
                                                  (the fixnum max-bytes))))))
                (skip (or skip0 over))
