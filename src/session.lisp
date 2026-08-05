@@ -39,13 +39,23 @@ Returns (values stop-thunk srtp-context)."
         (src (or source (and tone (make-tone-source :hz tone-hz))))
         (running t))
     ;; inbound: SRTP -> RTP -> PCMU -> samples  (with bring-up diagnostics)
-    (let ((rx 0) (dec 0) (bad 0))
+    (let ((rx 0) (dec 0) (bad 0) (rtcp 0))
       (setf (webrtc-data:ice-agent-on-media agent)
             (lambda (pkt a b)
               (declare (ignore a b))
               (incf rx)
               (when (and log (= rx 1)) (funcall log (format nil "rx: first SRTP packet (~a bytes)" (length pkt))))
               (handler-case
+                  ;; RTCP first (RFC 5761 demux: the payload-type byte in 64-95 is RTCP, and
+                  ;; a browser starts sending receiver reports immediately).  It is SRTCP, not
+                  ;; SRTP — a different key and a different trailer — so feeding it to the RTP
+                  ;; unprotector fails, and reporting THAT as a keying mismatch is how a working
+                  ;; link gets diagnosed as a broken one.  We do not do RTCP yet; say so once.
+                  (if (and (>= (length pkt) 2) (<= 64 (logand (aref pkt 1) #x7f) 95))
+                      (progn
+                        (incf rtcp)
+                        (when (and log (= rtcp 1))
+                          (funcall log "rx: SRTCP (receiver reports) — not decoded, no RTCP here yet")))
                   (let ((rtp (srtp-unprotect ctx pkt)))
                     (cond
                       (rtp (incf dec)
@@ -58,7 +68,7 @@ Returns (values stop-thunk srtp-context)."
                                (when on-rx-pcm (funcall on-rx-pcm pcm r))
                                (when on-rx-level (funcall on-rx-level (rms-level pcm))))))
                       (t (incf bad)
-                         (when (and log (= bad 1)) (funcall log "rx: SRTP arriving but DECRYPT FAILS -> keying mismatch")))))
+                         (when (and log (= bad 1)) (funcall log "rx: SRTP arriving but DECRYPT FAILS -> keying mismatch"))))))
                 (error (e) (when log (funcall log (format nil "audio rx err: ~a" e))))))))
     ;; outbound: one frame per 20 ms, on a deadline rather than on (sleep 0.02).
     (bt:make-thread
