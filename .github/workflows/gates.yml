@@ -40,4 +40,4 @@ jobs:
           sbcl --non-interactive --eval '(ql:quickload (list :bordeaux-threads :hunchentoot :ironclad :usocket))'
       - name: Gate
         working-directory: webrtc-media
-        run: sbcl --dynamic-space-size 3072 --script inspect/rtp-gate.lisp
+        run: sbcl --dynamic-space-size 3072 --non-interactive --eval '(require :asdf)' --load inspect/rtp-gate.lisp
