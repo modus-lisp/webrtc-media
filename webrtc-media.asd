@@ -1,12 +1,17 @@
 (defsystem "webrtc-media"
   :description "A from-scratch WebRTC media plane in pure Common Lisp: SRTP/SRTCP (AES-GCM)
 and RTP/RTCP framing atop seal's DTLS + crypto, with the G.711 audio codec provided by reed
-(the pure-CL audio-codec library).  Pairs with webrtc-data (the SCTP data-channel plane) on
-the same bundled ICE/DTLS transport."
+and the VP8 video codec by reel (the pure-CL audio- and video-codec libraries).  Pairs with
+webrtc-data (the SCTP data-channel plane) on the same bundled ICE/DTLS transport.
+
+The codec used to live in here, in eight src/vp8-*.lisp files.  It is reel's now: an encoder
+is not a property of the transport that happens to carry it, and a caller who wants to encode
+a frame to a file should not be loading SRTP to do it.  vp8-rtp.lisp — the RFC 7741 payload
+format and the capture-driven sender — stays, because that IS transport."
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("seal" "reed")
+  :depends-on ("seal" "reed" "reel")
   :serial t
   :components
   ((:module "src"
@@ -15,15 +20,7 @@ the same bundled ICE/DTLS transport."
     ((:file "packages")
      (:file "audio")       ; the 20 ms / 8 kHz audio frame + the SOURCE thunk that produces one
      (:file "rtp")         ; RTP + RTCP header pack/parse (RFC 3550)
-     (:file "srtp")        ; DTLS-SRTP keying (RFC 5764) + SRTP/SRTCP AES-GCM (RFC 7714)
-     (:file "vp8-bool")     ; VP8 boolean entropy coder (RFC 6386 §7/§13)
-     (:file "vp8-dct")      ; VP8 4x4 DCT/WHT + quantization (RFC 6386 §14)
-     (:file "vp8-tables")   ; VP8 constant probability tables (from libvpx)
-     (:file "vp8-tokens")   ; VP8 coefficient token coding (RFC 6386 §13)
-     (:file "vp8")          ; VP8 keyframe encoder (RFC 6386 §9)
-     (:file "vp8-encode")   ; real encoder
-     (:file "vp8-parse")   ; bitstream parser (debug oracle)
-     (:file "vp8-inter")))))  ; inter (P) frames: ZEROMV / global motion vector + skip ; bitstream parser (debug oracle)  ; real encoder: DC+AC, entropy contexts, prediction+reconstruction
+     (:file "srtp")))))    ; DTLS-SRTP keying (RFC 5764) + SRTP/SRTCP AES-GCM (RFC 7714)
 
 (defsystem "webrtc-media/rtc"
   :description "Session glue: full-duplex G.711/SRTP audio over a webrtc-data ICE/DTLS transport."
