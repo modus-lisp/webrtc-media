@@ -22,7 +22,7 @@ jobs:
       # build rather than a missing line here.
       - name: Sibling checkouts
         run: |
-          for repo in cl-transport natrium reed seal webrtc-data; do
+          for repo in cl-transport natrium reed reel seal webrtc-data; do
             git clone --depth 1 -q https://github.com/modus-lisp/$repo.git "$repo"
           done
       - name: Install SBCL
