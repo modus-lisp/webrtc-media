@@ -27,7 +27,9 @@
    #:rtp-pt #:rtp-marker #:rtp-seq #:rtp-timestamp #:rtp-ssrc #:rtp-payload
    ;; SRTP
    #:srtp-context #:make-srtp-context #:srtp-context-from-dtls
-   #:srtp-protect #:srtp-unprotect
+   #:srtp-protect #:srtp-unprotect #:srtcp-unprotect
+   ;; RTCP feedback (rtcp.lisp)
+   #:handle-rtcp #:rtcp-feedback #:*rtcp-on-nack* #:*rtcp-on-pli* #:*rtcp-stats*
    #:+srtp-aead-aes-128-gcm+
    ;; session glue (webrtc-media/rtc)
    #:start-audio #:start-video #:vp8-packetize

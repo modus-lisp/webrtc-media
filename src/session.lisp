@@ -50,12 +50,18 @@ Returns (values stop-thunk srtp-context)."
                   ;; a browser starts sending receiver reports immediately).  It is SRTCP, not
                   ;; SRTP — a different key and a different trailer — so feeding it to the RTP
                   ;; unprotector fails, and reporting THAT as a keying mismatch is how a working
-                  ;; link gets diagnosed as a broken one.  We do not do RTCP yet; say so once.
+                  ;; link gets diagnosed as a broken one.  Decrypted with SRTCP's own keys, it is
+                  ;; the browser's feedback on our video -- lost packets, picture loss (rtcp.lisp).
                   (if (and (>= (length pkt) 2) (<= 64 (logand (aref pkt 1) #x7f) 95))
-                      (progn
+                      (let ((plain (srtcp-unprotect ctx pkt)))
                         (incf rtcp)
+                        (if plain
+                            (handle-rtcp plain)
+                            (%rtcp-count :undecrypted))
                         (when (and log (= rtcp 1))
-                          (funcall log "rx: SRTCP (receiver reports) — not decoded, no RTCP here yet")))
+                          (funcall log (if plain
+                                           "rx: SRTCP decrypted -- the browser's feedback (NACK, PLI) reaches the video sender"
+                                           "rx: SRTCP arriving but DECRYPT FAILS -- no NACK/PLI recovery"))))
                   (let ((rtp (srtp-unprotect ctx pkt)))
                     (cond
                       (rtp (incf dec)

@@ -450,6 +450,13 @@ At 2.5 s the same scroll switches twice."
 ;; costs exactly one keyframe however many times it is set in the meantime.  Same mechanism as
 ;; *VIDEO-PROFILE*: a special the loop re-reads each pass, so nothing has to reach into the thread.
 (defvar *force-keyframe* nil)
+
+(defparameter *video-history* 1024
+  "How many sent video packets START-VIDEO keeps for resending when the browser NACKs them: a
+second or more of video at any rung, by sequence number.")
+
+(defparameter *pli-keyframe-secs* 2
+  "The shortest gap between keyframes forced by the browser's picture-loss reports (PLI).")
 (defvar *video-profile-applied* nil)      ; last plist logged, so a switch is reported once
 
 (defvar *video-input-at* 0
@@ -810,6 +817,12 @@ have reassembled, when it would have had it.  Returns a STOP thunk."
   (let* ((running t)
          ;; ---- the send queue: the ONLY thing that sleeps at the link rate ----
          (queue '()) (pacing nil) (qlock (bt:make-lock "wm-video-pace"))
+         ;; ---- what the browser reports lost (rtcp.lisp) ----
+         ;; the last *VIDEO-HISTORY* packets as sent (SRTP bytes, by sequence number), so a NACK
+         ;; is answered by resending them: a lost fragment costs a round trip, not the picture
+         (history (make-array *video-history* :initial-element nil))
+         (hlock (bt:make-lock "wm-video-history"))
+         (resent 0) (pli-keys 0) (last-pli-key 0)
          ;; ---- pipeline timing, shared by both threads ----
          (st-take (make-pstat :name "take")) (st-enc (make-pstat :name "encode"))
          (st-send (make-pstat :name "send")) (st-loop (make-pstat :name "loop"))
@@ -864,7 +877,10 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                                (* (length pkts) 1024d0 target-kbs)))))
                               (dolist (p pkts)
                                 (unless sink
-                                  (webrtc-data:ice-send-to-peer agent (srtp-protect ctx p)))
+                                  (let ((sp (srtp-protect ctx p)) (q (%u16 p 2)))
+                                    (bt:with-lock-held (hlock)
+                                      (setf (aref history (mod q *video-history*)) (cons q sp)))
+                                    (webrtc-data:ice-send-to-peer agent sp)))
                                 (when gap (sleep gap)))
                               (when sink (funcall sink frame))))))
                     (error (e) (when log (funcall log (format nil "video pace: ~a" e)))))
@@ -1767,7 +1783,7 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                       :prioritised prioritised
                                       :cleanups cleanups)))
                      (when (and log (> dt 5000))
-                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B idle<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | over ~a (aimed ~a) defer ~a | cleans ~a"
+                       (funcall log (format nil "~a | ~a | ~a | ~a | ~a | ~a | ~a | sent ~a idle ~a seen ~a | ~,1f KB/s | ~,1f fps (want ~,1f, flags allow ~,1f, cap ~,1f) frame<=~a B idle<=~a B | 1/~a res (~a down ~a up) | qi ~a~@[+~a~] b/mb ~,0f mv-b/mb ~,1f | pend ~a | over ~a (aimed ~a) defer ~a | cleans ~a | nack resent ~a, pli keys ~a"
                                             (ps-line st-take) (ps-line st-enc) (ps-line st-clean)
                                             (ps-line st-send) (ps-line st-kb) (ps-line st-mbs)
                                             (ps-line st-mv)
@@ -1777,7 +1793,8 @@ sleep, which is what keeps the capture clock independent of the link rate."
                                             sc scale-drops scale-ups
                                             cur-qi (and (plusp qi-bias) qi-bias)
                                             (* bpu (qi-cost cur-qi)) mpu
-                                            (if pending (count 1 pending) 0) overruns prioritised deferrals cleanups))
+                                            (if pending (count 1 pending) 0) overruns prioritised deferrals cleanups
+                                            resent pli-keys))
                        (ps-reset st-take) (ps-reset st-enc) (ps-reset st-send) (ps-reset st-loop)
                        (ps-reset st-clean) (ps-reset st-kb) (ps-reset st-mbs) (ps-reset st-qi)
                        (ps-reset st-mv) (ps-reset st-lag)
@@ -1789,4 +1806,27 @@ sleep, which is what keeps the capture clock independent of the link rate."
              ;; neither of them is allowed to become the other's pacing.
              (sleep poll-secs))))
        :name "wm-video-tx")
-      (lambda () (setf running nil)))))
+      ;; THE BROWSER'S FEEDBACK, for as long as this stream runs.  Called on the network thread.
+      (let ((on-nack (lambda (seqs)
+                       (dolist (q seqs)
+                         (let ((e (bt:with-lock-held (hlock) (aref history (mod q *video-history*)))))
+                           (when (and e (= (car e) q))      ; still the packet it names, not a newer one
+                             (ignore-errors (webrtc-data:ice-send-to-peer agent (cdr e)))
+                             (incf resent))))))
+            (on-pli (lambda ()
+                      ;; A keyframe is the expensive thing, and a browser repeats its PLI until
+                      ;; one arrives: one forced keyframe per *PLI-KEYFRAME-SECS*, and the rest
+                      ;; are the same request again.
+                      (let ((now (get-internal-real-time)))
+                        (when (> (- now last-pli-key)
+                                 (* *pli-keyframe-secs* internal-time-units-per-second))
+                          (setf last-pli-key now *force-keyframe* t)
+                          (incf pli-keys)
+                          (when log (funcall log (format nil "PLI: the browser lost the picture -- keyframe (~d so far, ~d packets resent)"
+                                                         pli-keys resent))))))))
+        (setf *rtcp-on-nack* on-nack *rtcp-on-pli* on-pli)
+        (lambda ()
+          (setf running nil)
+          ;; only our own: a newer stream may have installed its handlers since
+          (when (eq *rtcp-on-nack* on-nack) (setf *rtcp-on-nack* nil))
+          (when (eq *rtcp-on-pli* on-pli) (setf *rtcp-on-pli* nil)))))))

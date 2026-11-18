@@ -24,7 +24,8 @@
 (defstruct srtp-context
   send-key send-salt recv-key recv-salt
   (send-roc 0) (send-prev-seq nil)               ; rollover counters for the 48-bit index
-  (recv-roc 0) (recv-prev-seq nil))
+  (recv-roc 0) (recv-prev-seq nil)
+  recv-rtcp-key recv-rtcp-salt)                  ; SRTCP from the peer (its feedback: PLI, NACK)
 
 (defun make-srtp-context-keys (send-key send-salt recv-key recv-salt)
   "Build a context from explicit keys/salts (used by tests and by SRTP-CONTEXT-FROM-DTLS)."
@@ -47,6 +48,8 @@ counter mode with key_derivation_rate = 0.  The counter block is MASTER-SALT lef
 
 (defconstant +srtp-label-rtp-key+  #x00)
 (defconstant +srtp-label-rtp-salt+ #x02)
+(defconstant +srtp-label-rtcp-key+  #x03)       ; RFC 3711 §4.3.2: SRTCP's own session keys
+(defconstant +srtp-label-rtcp-salt+ #x05)
 
 (defun srtp-context-from-dtls (session &key (role :client))
   "Derive an SRTP context from a finished seal DTLS SESSION.  The DTLS-SRTP exporter yields the
@@ -59,11 +62,17 @@ server keys."
          (cms (subseq km 32 44)) (sms (subseq km 44 56)))        ; client/server MASTER salts
     (flet ((skey (mk ms) (srtp-kdf mk ms +srtp-label-rtp-key+ +gcm-key-len+))
            (ssalt (mk ms) (srtp-kdf mk ms +srtp-label-rtp-salt+ +gcm-salt-len+)))
-      (let ((ck (skey cmk cms)) (cs (ssalt cmk cms))
-            (sk (skey smk sms)) (ss (ssalt smk sms)))
-        (if (eq role :client)
-            (make-srtp-context-keys ck cs sk ss)
-            (make-srtp-context-keys sk ss ck cs))))))
+      (let* ((ck (skey cmk cms)) (cs (ssalt cmk cms))
+             (sk (skey smk sms)) (ss (ssalt smk sms))
+             (ctx (if (eq role :client)
+                      (make-srtp-context-keys ck cs sk ss)
+                      (make-srtp-context-keys sk ss ck cs))))
+        ;; SRTCP RECEIVE keys, from the PEER's master key: what it sends us -- receiver reports,
+        ;; and the feedback the video sender acts on (PLI, NACK) -- is SRTCP, keyed apart from SRTP.
+        (multiple-value-bind (pmk pms) (if (eq role :client) (values smk sms) (values cmk cms))
+          (setf (srtp-context-recv-rtcp-key ctx) (srtp-kdf pmk pms +srtp-label-rtcp-key+ +gcm-key-len+)
+                (srtp-context-recv-rtcp-salt ctx) (srtp-kdf pmk pms +srtp-label-rtcp-salt+ +gcm-salt-len+)))
+        ctx))))
 
 (declaim (inline %u16 %u32))
 (defun %u16 (buf off) (logior (ash (aref buf off) 8) (aref buf (1+ off))))
@@ -123,3 +132,35 @@ server keys."
           (setf (srtp-context-recv-roc ctx) roc (srtp-context-recv-prev-seq ctx) newprev)
           (let ((out (make-array (+ hlen (length pt)) :element-type '(unsigned-byte 8))))
             (replace out hdr) (replace out pt :start1 hlen) out))))))
+
+;;; ---- SRTCP, receive side (RFC 7714 §9) ------------------------------------------------------
+;;; An AEAD SRTCP packet is
+;;;   [8 octets: RTCP header + sender SSRC, in the clear] [ciphertext] [16-octet tag] [E | 31-bit index]
+;;; with AAD = the 8 clear octets ‖ the E|index word, and
+;;;   IV = (00 00 ‖ SSRC ‖ 00 00 ‖ 0|index(31)) XOR salt.
+
+(defun %srtcp-iv (salt ssrc index)
+  (let ((iv (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref iv 2) (ldb (byte 8 24) ssrc) (aref iv 3) (ldb (byte 8 16) ssrc)
+          (aref iv 4) (ldb (byte 8 8) ssrc)  (aref iv 5) (ldb (byte 8 0) ssrc))
+    (setf (aref iv 8) (ldb (byte 8 24) index) (aref iv 9) (ldb (byte 8 16) index)
+          (aref iv 10) (ldb (byte 8 8) index) (aref iv 11) (ldb (byte 8 0) index))
+    (dotimes (i 12 iv) (setf (aref iv i) (logxor (aref iv i) (aref salt i))))))
+
+(defun srtcp-unprotect (ctx srtcp-bytes)
+  "Decrypt+verify an SRTCP packet from the peer -> the plain compound RTCP packet, or NIL (a bad
+tag, an unencrypted packet, or no SRTCP keys in CTX)."
+  (let ((n (length srtcp-bytes)) (key (srtp-context-recv-rtcp-key ctx)))
+    (when (or (null key) (< n (+ 8 +gcm-tag-len+ 4))) (return-from srtcp-unprotect nil))
+    (let* ((eidx (%u32 srtcp-bytes (- n 4)))
+           (index (logand eidx #x7fffffff)))
+      (unless (logbitp 31 eidx) (return-from srtcp-unprotect nil))   ; E=0: not encrypted
+      (let* ((clear (subseq srtcp-bytes 0 8))
+             (aad (concatenate '(vector (unsigned-byte 8)) clear (subseq srtcp-bytes (- n 4))))
+             (ct (subseq srtcp-bytes 8 (- n 4 +gcm-tag-len+)))
+             (tag (subseq srtcp-bytes (- n 4 +gcm-tag-len+) (- n 4)))
+             (iv (%srtcp-iv (srtp-context-recv-rtcp-salt ctx) (%u32 srtcp-bytes 4) index))
+             (pt (seal:aes-gcm-decrypt key iv ct aad tag)))
+        (when pt
+          (let ((out (make-array (+ 8 (length pt)) :element-type '(unsigned-byte 8))))
+            (replace out clear) (replace out pt :start1 8) out))))))
